@@ -209,6 +209,94 @@ def get_created_on_batch_from_gsnow(session, incident_numbers, batch_size=1000):
     
     return result_dict
 
+def update_opened_at_batch_in_postgres(engine, table_name, updates_dict, batch_size=1000):
+    """
+    Update opened_at in PostgreSQL for multiple incidents in batch.
+    Much faster than updating one by one.
+    Only updates records where opened_at IS NULL.
+    
+    Parameters
+    ----------
+    engine : sqlalchemy.engine.Engine
+        SQLAlchemy engine
+    table_name : str
+        Table name
+    updates_dict : dict
+        Dictionary mapping incident_number -> created_on_value
+    batch_size : int
+        Number of updates per batch (default: 1000)
+        
+    Returns
+    -------
+    dict
+        Statistics: {'updated': count, 'failed': count}
+    """
+    results = {'updated': 0, 'failed': 0}
+    
+    if not updates_dict:
+        return results
+    
+    # Convert to list of tuples for batch processing
+    updates_list = list(updates_dict.items())
+    total_batches = (len(updates_list) + batch_size - 1) // batch_size
+    
+    logging.info(f"   Updating {len(updates_list):,} records in {total_batches} batches...")
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(updates_list))
+        batch = updates_list[start_idx:end_idx]
+        
+        try:
+            # Build batch UPDATE using CASE statement
+            case_statements = []
+            incident_numbers = []
+            
+            for inc_num, created_on_val in batch:
+                # Format datetime
+                if isinstance(created_on_val, pd.Timestamp):
+                    created_on_str = created_on_val.strftime('%Y-%m-%d %H:%M:%S')
+                elif isinstance(created_on_val, datetime):
+                    created_on_str = created_on_val.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    created_on_str = str(created_on_val)
+                
+                # Escape single quotes
+                safe_inc_num = inc_num.replace("'", "''")
+                incident_numbers.append(f"'{safe_inc_num}'")
+                case_statements.append(f"WHEN '{safe_inc_num}' THEN CAST('{created_on_str}' AS TIMESTAMP)")
+            
+            in_clause = ", ".join(incident_numbers)
+            case_when = "\n            ".join(case_statements)
+            
+            # Only update records where opened_at IS NULL (skip already updated ones)
+            update_query = text(f"""
+            UPDATE "{table_name}"
+            SET opened_at = CASE incident_number
+                {case_when}
+            END,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE incident_number IN ({in_clause})
+              AND data_source = 'gsnow'
+              AND opened_at IS NULL
+            """)
+            
+            with engine.connect() as conn:
+                result = conn.execute(update_query)
+                rows_updated = result.rowcount
+                conn.commit()
+                results['updated'] += rows_updated
+            
+            if (batch_num + 1) % 10 == 0 or batch_num == total_batches - 1:
+                logging.info(f"   Updated batch {batch_num + 1}/{total_batches} ({results['updated']:,} total updated)")
+                
+        except Exception as e:
+            logging.error(f"   ⚠️  Error updating batch {batch_num + 1}: {e}")
+            logging.error(traceback.format_exc())
+            results['failed'] += len(batch)
+    
+    return results
+
 def update_opened_at_in_postgres(engine, table_name, incident_number, created_on_value):
     """
     Update opened_at in PostgreSQL with created_on value.
@@ -383,10 +471,13 @@ def sync_gsnow_inc1_to_postgres(table_name=None, database=None,
         
         logging.info(f"✓ Fetched created_on for {len(created_on_dict):,} incidents from gsnow")
         
-        # Step 3: Update PostgreSQL
+        # Step 3: Update PostgreSQL in batches
         logging.info(f"\n{'='*80}")
-        logging.info("STEP 3: Updating PostgreSQL")
+        logging.info("STEP 3: Updating PostgreSQL in batches")
         logging.info(f"{'='*80}")
+        logging.info(f"   Records to update: {len(created_on_dict):,}")
+        logging.info(f"   Note: Only records with opened_at IS NULL will be updated")
+        logging.info(f"   (Already updated records will be skipped)")
         
         results = {
             'total': len(df_incidents),
@@ -397,46 +488,22 @@ def sync_gsnow_inc1_to_postgres(table_name=None, database=None,
             'skipped': 0
         }
         
-        # Process updates with progress bar
-        try:
-            from tqdm import tqdm
-            progress_bar = tqdm(df_incidents.iterrows(), total=len(df_incidents), desc="Updating", unit="incident")
-        except ImportError:
-            progress_bar = df_incidents.iterrows()
-            logging.info("   (Install tqdm for progress bar: pip install tqdm)")
+        # Filter out incidents not found in gsnow
+        incidents_to_update = {k: v for k, v in created_on_dict.items() if v is not None}
         
-        for idx, row in progress_bar:
-            incident_number = row['incident_number']
-            
-            # Get created_on from batch results
-            created_on_value = created_on_dict.get(incident_number)
-            
-            if created_on_value is None:
-                if idx < 5:  # Log first few
-                    logging.warning(f"   ⚠️  {incident_number}: Not found in gsnow")
-                continue
-            
-            # Update PostgreSQL
-            if not dry_run:
-                success = update_opened_at_in_postgres(
-                    pg_engine,
-                    table_name,
-                    incident_number,
-                    created_on_value
-                )
-                
-                if success:
-                    results['updated'] += 1
-                    if idx < 5:  # Log first few
-                        logging.info(f"   ✅ {incident_number}: Updated opened_at = {created_on_value}")
-                else:
-                    results['failed'] += 1
-                    if idx < 5:  # Log first few
-                        logging.error(f"   ❌ {incident_number}: Failed to update")
-            else:
-                results['skipped'] += 1
-                if idx < 5:  # Log first few
-                    logging.info(f"   🔍 {incident_number}: Would update opened_at = {created_on_value}")
+        if not dry_run and incidents_to_update:
+            # Update in batches
+            update_results = update_opened_at_batch_in_postgres(
+                pg_engine,
+                table_name,
+                incidents_to_update,
+                batch_size=1000
+            )
+            results['updated'] = update_results['updated']
+            results['failed'] = update_results['failed']
+        else:
+            # Dry run - just count
+            results['skipped'] = len(incidents_to_update)
         
         # Summary
         logging.info(f"\n{'='*80}")
