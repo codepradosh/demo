@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Push categorized incident CSV file to PostgreSQL table Incident_Data
-Usage: python push_incidents_to_postgres.py <csv_file_path> [--truncate]
+Sync gsnow created_on to PostgreSQL opened_at for INC1 incidents
+Flow:
+1. Fetch INC1 incident numbers from PostgreSQL (where opened_at is NULL)
+2. For each incident, search in gsnow
+3. Pull created_on from gsnow
+4. Update opened_at in PostgreSQL with created_on value
 """
 
 import os
@@ -11,20 +15,16 @@ import pandas as pd
 import traceback
 import logging
 from datetime import datetime
-import argparse
 from urllib.parse import quote_plus
+from dotenv import load_dotenv
+from pystarburst import Session
+from trino.auth import OAuth2Authentication
+from sqlalchemy import create_engine, text
+from tqdm import tqdm
 
-# PostgreSQL client
-try:
-    import psycopg2
-    from sqlalchemy import create_engine, text, inspect
-    from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
-    POSTGRES_AVAILABLE = True
-except ImportError:
-    POSTGRES_AVAILABLE = False
-    print("ERROR: PostgreSQL libraries not available.")
-    print("Please install: pip install psycopg2-binary sqlalchemy pandas")
-    sys.exit(1)
+# Disable SSL warnings
+import urllib3
+urllib3.disable_warnings()
 
 # ------------------------------------------------------------------------
 # Logging Configuration
@@ -46,439 +46,382 @@ POSTGRES_CONFIG = {
     'database': os.getenv('PGDATABASE', 'service_automation_db'),
     'user': os.getenv('PGUSER', 'powerbi_user'),
     'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'incident_data'  # Changed to lowercase incident_data
+    'table_name': 'incident_data'
 }
 
 # ------------------------------------------------------------------------
-# Data Type Inference
+# gsnow Configuration (from daily_load_incidents.py)
 # ------------------------------------------------------------------------
-def infer_postgres_type(series, col_name):
-    """
-    Infer PostgreSQL data type from pandas Series.
-    
-    Parameters
-    ----------
-    series : pd.Series
-        The pandas Series to analyze
-    col_name : str
-        Column name (for special handling)
-    
-    Returns
-    -------
-    sqlalchemy.types.TypeEngine
-        SQLAlchemy type for PostgreSQL
-    """
-    # Remove null values for type inference
-    non_null = series.dropna()
-    
-    if len(non_null) == 0:
-        # All nulls - default to Text
-        return Text
-    
-    # Check for boolean
-    if series.dtype == 'bool' or non_null.dtype == 'bool':
-        return Boolean
-    
-    # Check for datetime
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return DateTime
-    
-    # Check for date
-    if pd.api.types.is_datetime64_any_dtype(series) and 'date' in col_name.lower():
-        # Try to parse as date if it's a date column
-        try:
-            pd.to_datetime(non_null.iloc[0])
-            return Date
-        except:
-            pass
-    
-    # Check for integer
-    if pd.api.types.is_integer_dtype(series):
-        # Check if values fit in regular integer or need bigint
-        if non_null.abs().max() < 2147483647:  # PostgreSQL INTEGER max
-            return Integer
-        else:
-            return BigInteger
-    
-    # Check for float
-    if pd.api.types.is_float_dtype(series):
-        return Float
-    
-    # Check if numeric string can be converted to int
-    if series.dtype == 'object':
-        # Try to convert to numeric
-        try:
-            numeric_series = pd.to_numeric(non_null, errors='coerce')
-            if numeric_series.notna().sum() == len(non_null):
-                # All values are numeric
-                if numeric_series.abs().max() < 2147483647:
-                    return Integer
-                else:
-                    return BigInteger
-        except:
-            pass
-    
-    # Check string length for VARCHAR vs TEXT
-    if series.dtype == 'object':
-        max_length = non_null.astype(str).str.len().max()
-        if max_length > 0 and max_length < 255:
-            # Use VARCHAR with some buffer
-            return String(max_length + 50)  # Add 50 char buffer
-        else:
-            return Text
-    
-    # Default to Text
-    return Text
+GSNOW_CONNECTION_DETAILS = [
+    {
+        "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType=LDAP Authentication;SSL=1",
+        "catalogName": "ts_dwh_gsnow",
+        "schemaName": "ts_dwh_gsnow_schema",
+        "tableName": "gsnow_inc_main_unstrreq_36mth",
+        "dataproductId": "72567983-5ac4-405b-a6f8-6b9bd79244fe",
+        "outputportId": "1709c349-7dae-492f-934e-2ce4bb5c5870"
+    }
+]
 
-def create_table_from_dataframe(engine, df, table_name, schema='public'):
+def create_gsnow_session():
+    """Create PyStarburst session for gsnow catalog"""
+    connection_details = GSNOW_CONNECTION_DETAILS
+    
+    session = None
+    catalog_name = None
+    
+    for platform_connection_info in connection_details:
+        if platform_connection_info.get("catalogName") == "ts_dwh_gsnow":
+            connection_string_list = platform_connection_info["connectionString"].split(";")
+            catalog_name = platform_connection_info["catalogName"]
+            
+            starburst_connection_details = {}
+            for elem in connection_string_list:
+                if "=" in elem:
+                    key, value = elem.split("=", 1)
+                    starburst_connection_details[key.strip()] = value.strip()
+            
+            host = starburst_connection_details.get("Host")
+            port = starburst_connection_details.get("Port", "443")
+            
+            db_parameters = {
+                "host": host,
+                "port": port,
+                "http_scheme": "https",
+                "verify": False,
+                "auth": OAuth2Authentication(),
+                "catalog": catalog_name
+            }
+            session = Session.builder.configs(db_parameters).create()
+            break
+    
+    return session, catalog_name
+
+def get_inc1_incidents_from_postgres(engine, table_name, incident_prefix='INC1', limit=None):
     """
-    Create PostgreSQL table from DataFrame with inferred data types.
+    Fetch INC1 incident numbers from PostgreSQL where opened_at is NULL.
     
     Parameters
     ----------
     engine : sqlalchemy.engine.Engine
         SQLAlchemy engine
-    df : pd.DataFrame
-        DataFrame to create table from
     table_name : str
-        Table name (will be created in lowercase)
-    schema : str
-        Schema name (default: 'public')
+        Table name
+    incident_prefix : str
+        Incident number prefix (default: 'INC1')
+    limit : int, optional
+        Maximum number of incidents to fetch (default: None = all)
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with incident_number and sys_created_on columns
+    """
+    query = f"""
+    SELECT 
+        incident_number,
+        sys_created_on
+    FROM "{table_name}"
+    WHERE data_source = 'gsnow'
+      AND opened_at IS NULL
+      AND incident_number LIKE '{incident_prefix}%'
+    ORDER BY incident_number
+    """
     
+    if limit:
+        query += f" LIMIT {limit}"
+    
+    df = pd.read_sql(query, engine)
+    return df
+
+def get_created_on_from_gsnow(session, incident_number):
+    """
+    Get created_on value from gsnow for a specific incident number.
+    
+    Parameters
+    ----------
+    session : pystarburst.Session
+        gsnow session
+    incident_number : str
+        Incident number to search
+        
+    Returns
+    -------
+    datetime or None
+        created_on value or None if not found
+    """
+    schema = "ts_dwh_gsnow_schema"
+    table = "gsnow_inc_main_unstrreq_36mth"
+    table_ref = f"{schema}.{table}"
+    
+    query = f"""
+    SELECT created_on
+    FROM {table_ref}
+    WHERE inc_number = '{incident_number}'
+    LIMIT 1;
+    """
+    
+    try:
+        df = session.sql(query).to_pandas()
+        if len(df) > 0 and df['created_on'].notna().iloc[0]:
+            return pd.to_datetime(df['created_on'].iloc[0])
+        return None
+    except Exception as e:
+        logging.warning(f"   ⚠️  Error fetching created_on for {incident_number}: {e}")
+        return None
+
+def update_opened_at_in_postgres(engine, table_name, incident_number, created_on_value):
+    """
+    Update opened_at in PostgreSQL with created_on value.
+    
+    Parameters
+    ----------
+    engine : sqlalchemy.engine.Engine
+        SQLAlchemy engine
+    table_name : str
+        Table name
+    incident_number : str
+        Incident number to update
+    created_on_value : datetime
+        created_on value to use for opened_at
+        
     Returns
     -------
     bool
         True if successful, False otherwise
     """
     try:
-        logging.info(f"\n{'='*80}")
-        logging.info(f"📋 CREATING TABLE: {table_name}")
-        logging.info(f"{'='*80}")
-        
-        # Infer column types
-        column_types = {}
-        for col in df.columns:
-            pg_type = infer_postgres_type(df[col], col)
-            column_types[col] = pg_type
-            logging.info(f"   {col}: {pg_type}")
-        
-        # Build CREATE TABLE SQL
-        columns_sql = []
-        for col in df.columns:
-            pg_type = column_types[col]
-            
-            # Convert SQLAlchemy type to PostgreSQL type string
-            if pg_type == Boolean:
-                type_str = "BOOLEAN"
-            elif pg_type == Integer:
-                type_str = "INTEGER"
-            elif pg_type == BigInteger:
-                type_str = "BIGINT"
-            elif pg_type == Float:
-                type_str = "DOUBLE PRECISION"
-            elif pg_type == DateTime:
-                type_str = "TIMESTAMP"
-            elif pg_type == Date:
-                type_str = "DATE"
-            elif isinstance(pg_type, String):
-                type_str = f"VARCHAR({pg_type.length})"
-            else:
-                type_str = "TEXT"
-            
-            # Escape column name if needed
-            col_escaped = f'"{col}"'
-            columns_sql.append(f"{col_escaped} {type_str}")
-        
-        # Add created_at and updated_at timestamps
-        columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {schema}."{table_name}" (
-            {', '.join(columns_sql)}
-        );
+        update_query = f"""
+        UPDATE "{table_name}"
+        SET opened_at = :created_on_value,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE incident_number = :incident_number
+          AND data_source = 'gsnow';
         """
         
-        logging.info(f"\n⏳ Creating table '{table_name}'...")
         with engine.connect() as conn:
-            conn.execute(text(create_table_sql))
+            result = conn.execute(
+                text(update_query),
+                {
+                    'created_on_value': created_on_value,
+                    'incident_number': incident_number
+                }
+            )
             conn.commit()
-        
-        logging.info(f"✅ Table '{table_name}' created successfully")
-        logging.info(f"   Columns: {len(df.columns) + 2} (including created_at, updated_at)")
-        
-        return True
-        
+            return result.rowcount > 0
     except Exception as e:
-        logging.error(f"❌ Error creating table: {e}")
-        logging.error(traceback.format_exc())
+        logging.error(f"   ❌ Error updating {incident_number}: {e}")
         return False
 
-# ------------------------------------------------------------------------
-# Main Function
-# ------------------------------------------------------------------------
-def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
-                                 user=None, host=None, port=None, password=None,
-                                 truncate=False, create_table=True):
+def sync_gsnow_inc1_to_postgres(table_name=None, database=None, 
+                                user=None, host=None, port=None, password=None,
+                                incident_prefix='INC1', limit=None, dry_run=True):
     """
-    Push categorized incident CSV file to PostgreSQL table.
+    Main function to sync gsnow created_on to PostgreSQL opened_at.
     
     Parameters
     ----------
-    csv_file_path : str
-        Path to the categorized CSV file to import
     table_name : str, optional
-        Target table name (default: 'Incident_Data')
+        Target table name (default: 'incident_data')
     database : str, optional
-        Database name (default: from config or 'service_automation_db')
+        Database name (default: from config)
     user : str, optional
         PostgreSQL username (default: from config)
     host : str, optional
         PostgreSQL host (default: from config)
     port : str, optional
-        PostgreSQL port (default: from config or '5432')
+        PostgreSQL port (default: from config)
     password : str, optional
-        PostgreSQL password (default: from environment variable PGPASSWORD)
-    truncate : bool, optional
-        If True, truncate table before inserting (default: False)
+        PostgreSQL password (default: from environment variable)
+    incident_prefix : str, optional
+        Incident number prefix (default: 'INC1')
+    limit : int, optional
+        Maximum number of incidents to process (default: None = all)
+    dry_run : bool, optional
+        If True, only show what would be updated (default: True)
         
     Returns
     -------
     bool
         True if successful, False otherwise
     """
-    if not POSTGRES_AVAILABLE:
-        logging.error("✗ PostgreSQL libraries not available. Cannot export to PostgreSQL.")
-        return False
-    
-    if not os.path.exists(csv_file_path):
-        logging.error(f"✗ CSV file not found: {csv_file_path}")
-        return False
-    
-    # Use provided values or fall back to config/environment
-    table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()  # Ensure lowercase
-    database = database or POSTGRES_CONFIG['database']
-    user = user or POSTGRES_CONFIG['user']
-    host = host or POSTGRES_CONFIG['host']
-    port = port or POSTGRES_CONFIG['port']
-    password = password or POSTGRES_CONFIG['password']
-    
     try:
         logging.info("="*80)
-        logging.info("📤 Pushing Incident CSV to PostgreSQL")
+        logging.info("🔄 SYNC GSNOW created_on TO POSTGRESQL opened_at")
         logging.info("="*80)
-        logging.info(f"   CSV file: {csv_file_path}")
-        logging.info(f"   Database: {database}")
-        logging.info(f"   Table: {table_name}")
-        logging.info(f"   Host: {host}:{port}")
-        logging.info(f"   User: {user}")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Create table: {create_table}")
+        logging.info(f"   Database: {database or POSTGRES_CONFIG['database']}")
+        logging.info(f"   Table: {table_name or POSTGRES_CONFIG['table_name']}")
+        logging.info(f"   Incident prefix: {incident_prefix}")
+        logging.info(f"   Limit: {limit or 'All'}")
+        logging.info(f"   Mode: {'DRY RUN (no changes)' if dry_run else 'LIVE UPDATE'}")
         logging.info("="*80)
         
-        # Read CSV file
-        logging.info(f"\n⏳ Reading CSV file...")
-        try:
-            df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
-        except UnicodeDecodeError:
-            try:
-                df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
-            except:
-                df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
+        # Connect to PostgreSQL
+        table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()
+        database = database or POSTGRES_CONFIG['database']
+        user = user or POSTGRES_CONFIG['user']
+        host = host or POSTGRES_CONFIG['host']
+        port = port or POSTGRES_CONFIG['port']
+        password = password or POSTGRES_CONFIG['password']
         
-        logging.info(f"✓ Read {len(df):,} rows from CSV")
-        logging.info(f"✓ Columns: {len(df.columns)} ({', '.join(df.columns[:5])}...)")
-        
-        # Convert date columns to datetime if they're strings
-        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
-                        'created_on', 'updated_on', 'opened_date', 'closed_date']
-        for col in df.columns:
-            if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
-                if df[col].dtype == 'object':
-                    try:
-                        df[col] = pd.to_datetime(df[col], errors='coerce')
-                        logging.info(f"✓ Converted {col} to datetime")
-                    except:
-                        pass
-        
-        # Convert boolean columns
-        bool_columns = ['active', 'made_sla']
-        for col in bool_columns:
-            if col in df.columns:
-                df[col] = df[col].astype(bool)
-        
-        # Convert integer columns
-        int_columns = ['reassignment_count', 'reopen_count']
-        for col in int_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
-        
-        # Create connection string with URL-encoded password
-        # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
-        if password:
-            # URL-encode the password to handle special characters like @
-            encoded_password = quote_plus(password)
-            connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
-        else:
-            # Try without password (trust authentication or .pgpass)
-            connection_string = f"postgresql://{user}@{host}:{port}/{database}"
-        
-        # Create SQLAlchemy engine
         logging.info(f"\n⏳ Connecting to PostgreSQL...")
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        
-        # Test connection
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logging.info(f"✓ Connected to PostgreSQL successfully")
-        
-        # Check if table exists
-        logging.info(f"\n⏳ Checking if table '{table_name}' exists...")
-        inspector = inspect(engine)
-        table_exists = inspector.has_table(table_name, schema='public')
-        
-        if not table_exists:
-            if create_table:
-                logging.info(f"⚠️  Table '{table_name}' does not exist. Creating it...")
-                success = create_table_from_dataframe(engine, df, table_name)
-                if not success:
-                    logging.error(f"✗ Failed to create table '{table_name}'")
-                    engine.dispose()
-                    return False
-            else:
-                logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
-                logging.error(f"  Use --create-table to create it automatically")
-                engine.dispose()
-                return False
+        if password:
+            encoded_password = quote_plus(password)
+            pg_connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
         else:
-            logging.info(f"✓ Table '{table_name}' exists")
+            pg_connection_string = f"postgresql://{user}@{host}:{port}/{database}"
         
-        # Get table column names
-        logging.info(f"\n⏳ Fetching table column names...")
-        table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
+        pg_engine = create_engine(pg_connection_string, pool_pre_ping=True)
         
-        col_count = len(table_columns)
-        logging.info(f"✓ Table has {col_count} columns")
+        with pg_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logging.info(f"✅ Connected to PostgreSQL")
         
-        # Validate CSV columns match table columns
-        logging.info(f"\n⏳ Validating column names...")
+        # Connect to gsnow
+        logging.info(f"\n⏳ Connecting to gsnow...")
+        gsnow_session, catalog_name = create_gsnow_session()
         
-        csv_columns = [col for col in df.columns]
-        table_columns_lower = {col.lower(): col for col in table_columns}
+        if not gsnow_session:
+            logging.error("❌ Failed to create gsnow session")
+            pg_engine.dispose()
+            return False
         
-        # Create column mapping (case-insensitive match)
-        column_mapping = {}
-        for csv_col in csv_columns:
-            csv_col_lower = csv_col.lower()
-            if csv_col_lower in table_columns_lower:
-                table_col = table_columns_lower[csv_col_lower]
-                if csv_col != table_col:
-                    column_mapping[csv_col] = table_col
+        logging.info(f"✅ Connected to gsnow catalog: {catalog_name}")
         
-        if column_mapping:
-            df.rename(columns=column_mapping, inplace=True)
-            logging.info(f"✓ Renamed {len(column_mapping)} columns to match table case")
+        # Step 1: Fetch INC1 incidents from PostgreSQL
+        logging.info(f"\n{'='*80}")
+        logging.info("STEP 1: Fetching INC1 incidents from PostgreSQL")
+        logging.info(f"{'='*80}")
         
-        # Find missing columns in CSV
-        metadata_cols = {'created_at', 'updated_at'}
-        missing_in_csv = []
-        for table_col in table_columns:
-            if table_col.lower() not in [c.lower() for c in df.columns] and table_col not in metadata_cols:
-                missing_in_csv.append(table_col)
-                df[table_col] = None
-        
-        if missing_in_csv:
-            logging.warning(f"\n⚠️  CSV is missing {len(missing_in_csv)} table columns (set to NULL):")
-            for col in missing_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(missing_in_csv) > 10:
-                logging.warning(f"   ... and {len(missing_in_csv) - 10} more")
-        
-        # Find extra columns in CSV (not in table)
-        extra_in_csv = []
-        for csv_col in df.columns:
-            if csv_col not in table_columns and csv_col not in metadata_cols:
-                extra_in_csv.append(csv_col)
-        
-        if extra_in_csv:
-            logging.warning(f"\n⚠️  CSV has {len(extra_in_csv)} extra columns (will be ignored):")
-            for col in extra_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(extra_in_csv) > 10:
-                logging.warning(f"   ... and {len(extra_in_csv) - 10} more")
-        
-        # Filter DataFrame to only include columns that exist in table
-        columns_to_insert = [col for col in table_columns if col not in metadata_cols]
-        df_final = df[[col for col in columns_to_insert if col in df.columns]].copy()
-        
-        # Check existing row count
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            existing_rows = result.fetchone()[0]
-        logging.info(f"✓ Table currently has {existing_rows:,} rows")
-        
-        # Truncate table if requested
-        if truncate:
-            logging.info(f"\n⏳ Truncating table '{table_name}'...")
-            with engine.connect() as conn:
-                conn.execute(text(f'TRUNCATE TABLE "{table_name}";'))
-                conn.commit()
-            logging.info(f"✓ Table truncated")
-        
-        # Push to database
-        logging.info(f"\n⏳ Writing {len(df_final):,} rows to PostgreSQL table '{table_name}'...")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Columns: {len(df_final.columns)} columns matching table structure")
-        logging.info(f"   Chunk size: 1000 rows per batch")
-        
-        df_final.to_sql(
-            name=table_name,
-            con=engine,
-            schema='public',
-            if_exists='append',  # Append since we truncated if needed
-            index=False,
-            method='multi',  # Use multi-row INSERT for better performance
-            chunksize=1000
+        df_incidents = get_inc1_incidents_from_postgres(
+            pg_engine, 
+            table_name, 
+            incident_prefix=incident_prefix,
+            limit=limit
         )
         
-        engine.dispose()
+        if len(df_incidents) == 0:
+            logging.info(f"✓ No incidents found with NULL opened_at and prefix '{incident_prefix}'")
+            pg_engine.dispose()
+            return True
         
-        # Verify final row count
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            final_rows = result.fetchone()[0]
-        engine.dispose()
+        logging.info(f"✓ Found {len(df_incidents):,} incidents to process")
+        logging.info(f"   Sample incident numbers: {', '.join(df_incidents['incident_number'].head(10).tolist())}")
         
+        # Step 2: Process each incident one by one
         logging.info(f"\n{'='*80}")
-        logging.info("✅ SUCCESS!")
+        logging.info("STEP 2: Processing incidents one by one")
         logging.info(f"{'='*80}")
-        logging.info(f"✓ Wrote {len(df_final):,} rows to PostgreSQL")
-        logging.info(f"✓ Database: {database}")
-        logging.info(f"✓ Table: {table_name}")
-        logging.info(f"✓ Total rows in table now: {final_rows:,}")
-        if not truncate:
-            logging.info(f"   (Previous: {existing_rows:,}, Added: {len(df_final):,})")
+        logging.info(f"   Fetching created_on from gsnow for each incident...")
+        
+        results = {
+            'total': len(df_incidents),
+            'found_in_gsnow': 0,
+            'not_found_in_gsnow': 0,
+            'updated': 0,
+            'failed': 0,
+            'skipped': 0
+        }
+        
+        # Process with progress bar
+        try:
+            from tqdm import tqdm
+            progress_bar = tqdm(df_incidents.iterrows(), total=len(df_incidents), desc="Processing", unit="incident")
+        except ImportError:
+            progress_bar = df_incidents.iterrows()
+            logging.info("   (Install tqdm for progress bar: pip install tqdm)")
+        
+        for idx, row in progress_bar:
+            incident_number = row['incident_number']
+            sys_created_on = row['sys_created_on']
+            
+            # Step 2a: Search in gsnow
+            created_on_value = get_created_on_from_gsnow(gsnow_session, incident_number)
+            
+            if created_on_value is None:
+                results['not_found_in_gsnow'] += 1
+                if idx < 5:  # Log first few
+                    logging.warning(f"   ⚠️  {incident_number}: Not found in gsnow")
+                continue
+            
+            results['found_in_gsnow'] += 1
+            
+            # Step 2b: Update PostgreSQL
+            if not dry_run:
+                success = update_opened_at_in_postgres(
+                    pg_engine,
+                    table_name,
+                    incident_number,
+                    created_on_value
+                )
+                
+                if success:
+                    results['updated'] += 1
+                    if idx < 5:  # Log first few
+                        logging.info(f"   ✅ {incident_number}: Updated opened_at = {created_on_value}")
+                else:
+                    results['failed'] += 1
+                    if idx < 5:  # Log first few
+                        logging.error(f"   ❌ {incident_number}: Failed to update")
+            else:
+                results['skipped'] += 1
+                if idx < 5:  # Log first few
+                    logging.info(f"   🔍 {incident_number}: Would update opened_at = {created_on_value}")
+        
+        # Summary
+        logging.info(f"\n{'='*80}")
+        logging.info("✅ SYNC COMPLETED")
+        logging.info(f"{'='*80}")
+        logging.info(f"📊 Summary:")
+        logging.info(f"   Total incidents processed: {results['total']:,}")
+        logging.info(f"   Found in gsnow: {results['found_in_gsnow']:,}")
+        logging.info(f"   Not found in gsnow: {results['not_found_in_gsnow']:,}")
+        
+        if dry_run:
+            logging.info(f"   Would update: {results['skipped']:,}")
+            logging.info(f"\n   Run with --execute to apply changes")
+        else:
+            logging.info(f"   Successfully updated: {results['updated']:,}")
+            logging.info(f"   Failed to update: {results['failed']:,}")
+        
         logging.info(f"{'='*80}\n")
         
+        pg_engine.dispose()
         return True
         
     except Exception as e:
-        logging.error(f"\n✗ Failed to export to PostgreSQL: {e}")
+        logging.error(f"\n✗ Failed to sync: {e}")
         logging.error(traceback.format_exc())
         return False
 
 def main():
     """Main execution function."""
+    import argparse
+    
     setup_logging()
     
     parser = argparse.ArgumentParser(
-        description='Push categorized incident CSV to PostgreSQL',
+        description='Sync gsnow created_on to PostgreSQL opened_at for INC1 incidents',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Flow:
+1. Fetch INC1 incident numbers from PostgreSQL (where opened_at is NULL)
+2. For each incident, search in gsnow
+3. Pull created_on from gsnow
+4. Update opened_at in PostgreSQL with created_on value
+
 Examples:
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --truncate
+  # Dry run (show what would be updated, no changes)
+  python sync_gsnow_inc1_to_postgres.py
+  
+  # Dry run with limit
+  python sync_gsnow_inc1_to_postgres.py --limit 100
+  
+  # Execute the update
+  python sync_gsnow_inc1_to_postgres.py --execute
+  
+  # Execute with custom prefix and limit
+  python sync_gsnow_inc1_to_postgres.py --execute --prefix INC2 --limit 500
 
 Environment variables (optional):
   PGHOST=localhost
@@ -486,35 +429,29 @@ Environment variables (optional):
   PGDATABASE=service_automation_db
   PGUSER=postgres
   PGPASSWORD=your_password
-
-Or use .pgpass file for password-less authentication
         """
     )
     
-    parser.add_argument('csv_file', help='Path to categorized incident CSV file')
-    parser.add_argument('--truncate', action='store_true', 
-                       help='Truncate table before inserting (overwrite mode)')
+    parser.add_argument('--execute', action='store_true',
+                       help='Execute the update (default: dry run mode)')
     parser.add_argument('--table', type=str, default=None,
-                       help='Table name (default: incident_data, will be lowercase)')
+                       help='Table name (default: incident_data)')
     parser.add_argument('--database', type=str, default=None,
                        help='Database name (default: from config)')
-    parser.add_argument('--no-create-table', action='store_true',
-                       help='Do not create table if it does not exist (default: auto-create)')
+    parser.add_argument('--prefix', type=str, default='INC1',
+                       help='Incident number prefix (default: INC1)')
+    parser.add_argument('--limit', type=int, default=None,
+                       help='Maximum number of incidents to process (default: all)')
     
     args = parser.parse_args()
     
-    # Check if file exists
-    if not os.path.exists(args.csv_file):
-        logging.error(f"✗ CSV file not found: {args.csv_file}")
-        sys.exit(1)
-    
-    # Push to PostgreSQL
-    success = push_incidents_to_postgresql(
-        args.csv_file,
+    # Sync
+    success = sync_gsnow_inc1_to_postgres(
         table_name=args.table,
         database=args.database,
-        truncate=args.truncate,
-        create_table=not args.no_create_table
+        incident_prefix=args.prefix,
+        limit=args.limit,
+        dry_run=not args.execute
     )
     
     if success:
@@ -524,4 +461,3 @@ Or use .pgpass file for password-less authentication
 
 if __name__ == "__main__":
     main()
-
