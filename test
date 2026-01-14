@@ -147,53 +147,67 @@ def get_inc1_incidents_from_postgres(engine, table_name, incident_prefix='INC1',
         df = pd.read_sql(query, conn)
     return df
 
-def get_created_on_from_gsnow(session, incident_number):
+def get_created_on_batch_from_gsnow(session, incident_numbers, batch_size=1000):
     """
-    Get created_on value from gsnow for a specific incident number.
+    Get created_on values from gsnow for multiple incident numbers in batch.
+    Much faster than querying one by one.
     
     Parameters
     ----------
     session : pystarburst.Session
         gsnow session
-    incident_number : str
-        Incident number to search
+    incident_numbers : list
+        List of incident numbers to search
+    batch_size : int
+        Number of incidents to query per batch (default: 1000)
         
     Returns
     -------
-    datetime or None
-        created_on value or None if not found
+    dict
+        Dictionary mapping incident_number -> created_on datetime
     """
     schema = "ts_dwh_gsnow_schema"
     table = "gsnow_inc_main_unstrreq_36mth"
     table_ref = f"{schema}.{table}"
     
-    # Escape single quotes in incident_number to prevent SQL injection
-    safe_incident_number = incident_number.replace("'", "''")
+    result_dict = {}
     
-    # Remove semicolon and format query properly for Trino/Starburst
-    query = f"""
-    SELECT created_on
-    FROM {table_ref}
-    WHERE inc_number = '{safe_incident_number}'
-    LIMIT 1
-    """
+    # Process in batches
+    total_batches = (len(incident_numbers) + batch_size - 1) // batch_size
     
-    try:
-        df = session.sql(query).to_pandas()
-        if len(df) > 0 and df['created_on'].notna().iloc[0]:
-            return pd.to_datetime(df['created_on'].iloc[0])
-        return None
-    except Exception as e:
-        # Only log first few errors to avoid spam
-        if not hasattr(get_created_on_from_gsnow, '_error_count'):
-            get_created_on_from_gsnow._error_count = 0
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min(start_idx + batch_size, len(incident_numbers))
+        batch = incident_numbers[start_idx:end_idx]
         
-        get_created_on_from_gsnow._error_count += 1
-        if get_created_on_from_gsnow._error_count <= 5:
-            logging.warning(f"   ⚠️  Error fetching created_on for {incident_number}: {e}")
-        elif get_created_on_from_gsnow._error_count == 6:
-            logging.warning(f"   ⚠️  (Suppressing further error messages for created_on fetch errors)")
-        return None
+        # Escape single quotes and create IN clause
+        safe_incident_numbers = [inc.replace("'", "''") for inc in batch]
+        in_clause = "', '".join(safe_incident_numbers)
+        
+        query = f"""
+        SELECT inc_number, created_on
+        FROM {table_ref}
+        WHERE inc_number IN ('{in_clause}')
+        """
+        
+        try:
+            df = session.sql(query).to_pandas()
+            
+            # Map results
+            for _, row in df.iterrows():
+                inc_num = row['inc_number']
+                created_on = row['created_on']
+                if pd.notna(created_on):
+                    result_dict[inc_num] = pd.to_datetime(created_on)
+            
+            if batch_num % 10 == 0 or batch_num == total_batches - 1:
+                logging.info(f"   Processed batch {batch_num + 1}/{total_batches} ({len(result_dict)} found so far)")
+                
+        except Exception as e:
+            logging.warning(f"   ⚠️  Error fetching batch {batch_num + 1}: {e}")
+            # Continue with next batch
+    
+    return result_dict
 
 def update_opened_at_in_postgres(engine, table_name, incident_number, created_on_value):
     """
@@ -380,45 +394,57 @@ def sync_gsnow_inc1_to_postgres(table_name=None, database=None,
         logging.info(f"✓ Found {len(df_incidents):,} incidents to process")
         logging.info(f"   Sample incident numbers: {', '.join(df_incidents['incident_number'].head(10).tolist())}")
         
-        # Step 2: Process each incident one by one
+        # Step 2: Fetch created_on from gsnow in BATCHES (much faster!)
         logging.info(f"\n{'='*80}")
-        logging.info("STEP 2: Processing incidents one by one")
+        logging.info("STEP 2: Fetching created_on from gsnow in batches")
         logging.info(f"{'='*80}")
-        logging.info(f"   Fetching created_on from gsnow for each incident...")
+        logging.info(f"   Fetching created_on for {len(df_incidents):,} incidents in batches of 1000...")
+        
+        incident_numbers_list = df_incidents['incident_number'].tolist()
+        
+        # Fetch all created_on values in batches
+        created_on_dict = get_created_on_batch_from_gsnow(
+            gsnow_session, 
+            incident_numbers_list,
+            batch_size=1000
+        )
+        
+        logging.info(f"✓ Fetched created_on for {len(created_on_dict):,} incidents from gsnow")
+        
+        # Step 3: Update PostgreSQL
+        logging.info(f"\n{'='*80}")
+        logging.info("STEP 3: Updating PostgreSQL")
+        logging.info(f"{'='*80}")
         
         results = {
             'total': len(df_incidents),
-            'found_in_gsnow': 0,
-            'not_found_in_gsnow': 0,
+            'found_in_gsnow': len(created_on_dict),
+            'not_found_in_gsnow': len(df_incidents) - len(created_on_dict),
             'updated': 0,
             'failed': 0,
             'skipped': 0
         }
         
-        # Process with progress bar
+        # Process updates with progress bar
         try:
             from tqdm import tqdm
-            progress_bar = tqdm(df_incidents.iterrows(), total=len(df_incidents), desc="Processing", unit="incident")
+            progress_bar = tqdm(df_incidents.iterrows(), total=len(df_incidents), desc="Updating", unit="incident")
         except ImportError:
             progress_bar = df_incidents.iterrows()
             logging.info("   (Install tqdm for progress bar: pip install tqdm)")
         
         for idx, row in progress_bar:
             incident_number = row['incident_number']
-            sys_created_on = row['sys_created_on']
             
-            # Step 2a: Search in gsnow
-            created_on_value = get_created_on_from_gsnow(gsnow_session, incident_number)
+            # Get created_on from batch results
+            created_on_value = created_on_dict.get(incident_number)
             
             if created_on_value is None:
-                results['not_found_in_gsnow'] += 1
                 if idx < 5:  # Log first few
                     logging.warning(f"   ⚠️  {incident_number}: Not found in gsnow")
                 continue
             
-            results['found_in_gsnow'] += 1
-            
-            # Step 2b: Update PostgreSQL
+            # Update PostgreSQL
             if not dry_run:
                 success = update_opened_at_in_postgres(
                     pg_engine,
