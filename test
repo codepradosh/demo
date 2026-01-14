@@ -167,11 +167,15 @@ def get_created_on_from_gsnow(session, incident_number):
     table = "gsnow_inc_main_unstrreq_36mth"
     table_ref = f"{schema}.{table}"
     
+    # Escape single quotes in incident_number to prevent SQL injection
+    safe_incident_number = incident_number.replace("'", "''")
+    
+    # Remove semicolon and format query properly for Trino/Starburst
     query = f"""
     SELECT created_on
     FROM {table_ref}
-    WHERE inc_number = '{incident_number}'
-    LIMIT 1;
+    WHERE inc_number = '{safe_incident_number}'
+    LIMIT 1
     """
     
     try:
@@ -180,7 +184,15 @@ def get_created_on_from_gsnow(session, incident_number):
             return pd.to_datetime(df['created_on'].iloc[0])
         return None
     except Exception as e:
-        logging.warning(f"   ⚠️  Error fetching created_on for {incident_number}: {e}")
+        # Only log first few errors to avoid spam
+        if not hasattr(get_created_on_from_gsnow, '_error_count'):
+            get_created_on_from_gsnow._error_count = 0
+        
+        get_created_on_from_gsnow._error_count += 1
+        if get_created_on_from_gsnow._error_count <= 5:
+            logging.warning(f"   ⚠️  Error fetching created_on for {incident_number}: {e}")
+        elif get_created_on_from_gsnow._error_count == 6:
+            logging.warning(f"   ⚠️  (Suppressing further error messages for created_on fetch errors)")
         return None
 
 def update_opened_at_in_postgres(engine, table_name, incident_number, created_on_value):
