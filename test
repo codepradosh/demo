@@ -245,55 +245,27 @@ def update_opened_at_in_postgres(engine, table_name, incident_number, created_on
         else:
             created_on_str = str(created_on_value)
         
-        # Use parameterized query - simpler approach that works with both SQLAlchemy 1.4 and 2.0
+        # Use parameterized query with CAST instead of ::timestamp
+        # CAST works better with SQLAlchemy parameters
         update_query = text(f"""
         UPDATE "{table_name}"
-        SET opened_at = :created_on_value::timestamp,
+        SET opened_at = CAST(:created_on_value AS TIMESTAMP),
             updated_at = CURRENT_TIMESTAMP
         WHERE incident_number = :incident_number
           AND data_source = 'gsnow'
         """)
         
         with engine.connect() as conn:
-            # Pass parameters as keyword arguments (SQLAlchemy 2.0 style)
+            # Pass parameters as dictionary (works with both SQLAlchemy 1.4 and 2.0)
             result = conn.execute(
                 update_query,
-                created_on_value=created_on_str,
-                incident_number=incident_number
+                {
+                    "created_on_value": created_on_str,
+                    "incident_number": incident_number
+                }
             )
             conn.commit()
             return result.rowcount > 0
-    except TypeError:
-        # Fallback for SQLAlchemy 1.4 style (parameters as dict)
-        try:
-            safe_incident_number = incident_number.replace("'", "''")
-            
-            if isinstance(created_on_value, pd.Timestamp):
-                created_on_str = created_on_value.strftime('%Y-%m-%d %H:%M:%S')
-            elif isinstance(created_on_value, datetime):
-                created_on_str = created_on_value.strftime('%Y-%m-%d %H:%M:%S')
-            else:
-                created_on_str = str(created_on_value)
-            
-            update_query = text(f"""
-            UPDATE "{table_name}"
-            SET opened_at = :created_on_value::timestamp,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE incident_number = :incident_number
-              AND data_source = 'gsnow'
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(
-                    update_query,
-                    {"created_on_value": created_on_str, "incident_number": incident_number}
-                )
-                conn.commit()
-                return result.rowcount > 0
-        except Exception as e2:
-            logging.error(f"   ❌ Error updating {incident_number}: {e2}")
-            traceback.print_exc()
-            return False
     except Exception as e:
         logging.error(f"   ❌ Error updating {incident_number}: {e}")
         traceback.print_exc()
