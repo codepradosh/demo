@@ -1,57 +1,63 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sync gsnow created_on to PostgreSQL opened_at for INC1 incidents
+Complete Incident Data Pipeline
 Flow:
-1. Fetch INC1 incident numbers from PostgreSQL (where opened_at is NULL)
-2. For each incident, search in gsnow
-3. Pull created_on from gsnow
-4. Update opened_at in PostgreSQL with created_on value
+1. Pull data from Atlas and gsnow (2024 to current)
+2. Merge them properly (Atlas PRIMARY, gsnow supplementary)
+3. Fix opened_at issue (use created_on as fallback for gsnow)
+4. Export to CSV
+5. Run categorization script (category_latest.py) with GPT clustering
+6. Load categorized data to PostgreSQL
 """
 
 import os
 import sys
+import json
 import pandas as pd
+import numpy as np
+import urllib3
+import datetime
 import traceback
-import logging
-from datetime import datetime
-from urllib.parse import quote_plus
+import re
+import subprocess
+import tempfile
+from pathlib import Path
 from dotenv import load_dotenv
 from pystarburst import Session
 from trino.auth import OAuth2Authentication
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
+from urllib.parse import quote_plus
 from tqdm import tqdm
 
 # Disable SSL warnings
-import urllib3
 urllib3.disable_warnings()
 
-# ------------------------------------------------------------------------
-# Logging Configuration
-# ------------------------------------------------------------------------
-def setup_logging():
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+# PostgreSQL imports
+try:
+    import psycopg2
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    print("Warning: PostgreSQL libraries not available. Install with: pip install psycopg2-binary sqlalchemy")
 
 # ------------------------------------------------------------------------
-# PostgreSQL Configuration
+# Configuration
 # ------------------------------------------------------------------------
-POSTGRES_CONFIG = {
-    'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
-    'port': os.getenv('PGPORT', '5432'),
-    'database': os.getenv('PGDATABASE', 'service_automation_db'),
-    'user': os.getenv('PGUSER', 'powerbi_user'),
-    'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'incident_data'
-}
+# Atlas connection details
+ATLAS_CONNECTION_DETAILS = [
+    {
+        "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType={LDAP Authentication};SSL=1",
+        "catalogName": "ipm_service_management",
+        "schemaName": "ipm_service_management_schema",
+        "tableName": "ipm_incident_flat",
+        "dataproductId": "281244d9-2e0f-4c77-ba20-964da41911b1",
+        "outputportId": "df9f6069-8ea1-4f0d-b01a-76e5ba693ca6"
+    }
+]
 
-# ------------------------------------------------------------------------
-# gsnow Configuration (from daily_load_incidents.py)
-# ------------------------------------------------------------------------
+# gsnow connection details
 GSNOW_CONNECTION_DETAILS = [
     {
         "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType=LDAP Authentication;SSL=1",
@@ -63,8 +69,61 @@ GSNOW_CONNECTION_DETAILS = [
     }
 ]
 
+# PostgreSQL Configuration
+POSTGRES_CONFIG = {
+    'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
+    'port': os.getenv('PGPORT', '5432'),
+    'database': os.getenv('PGDATABASE', 'service_automation_db'),
+    'user': os.getenv('PGUSER', 'powerbi_user'),
+    'password': os.getenv('PGPASSWORD', 'Report@123'),
+    'table_name': 'Incident_Data'  # Capitalized table name
+}
+
+# Azure OpenAI Configuration (for categorization)
+AZURE_ENDPOINT = "https://dh-automation-1.openai.azure.com/openai/v1"
+AZURE_API_VERSION = "2024-02-15-preview"
+GPT_MODEL = "gpt-4o-mini"
+AZURE_API_KEY = os.getenv('AZURE_OPENAI_API_KEY', '')
+
+# ------------------------------------------------------------------------
+# Database Connection Functions
+# ------------------------------------------------------------------------
+def create_atlas_session():
+    """Create PyStarburst session for IPM Service Management catalog (Atlas)"""
+    connection_details = ATLAS_CONNECTION_DETAILS
+    
+    session = None
+    catalog_name = None
+    
+    for platform_connection_info in connection_details:
+        if platform_connection_info.get("catalogName") == "ipm_service_management":
+            connection_string_list = platform_connection_info["connectionString"].split(";")
+            catalog_name = platform_connection_info["catalogName"]
+            
+            starburst_connection_details = {}
+            for elem in connection_string_list:
+                if "=" in elem:
+                    key, value = elem.split("=", 1)
+                    starburst_connection_details[key.strip()] = value.strip()
+            
+            host = starburst_connection_details.get("Host")
+            port = starburst_connection_details.get("Port", "443")
+            
+            db_parameters = {
+                "host": host,
+                "port": port,
+                "http_scheme": "https",
+                "verify": False,
+                "auth": OAuth2Authentication(),
+                "catalog": catalog_name
+            }
+            session = Session.builder.configs(db_parameters).create()
+            break
+    
+    return session, catalog_name
+
 def create_gsnow_session():
-    """Create PyStarburst session for gsnow catalog"""
+    """Create PyStarburst session for ts_dwh_gsnow catalog"""
     connection_details = GSNOW_CONNECTION_DETAILS
     
     session = None
@@ -97,498 +156,794 @@ def create_gsnow_session():
     
     return session, catalog_name
 
-def get_inc1_incidents_from_postgres(engine, table_name, incident_prefix='INC1', limit=None):
-    """
-    Fetch INC1 incident numbers from PostgreSQL where opened_at is NULL.
-    
-    Parameters
-    ----------
-    engine : sqlalchemy.engine.Engine
-        SQLAlchemy engine
-    table_name : str
-        Table name
-    incident_prefix : str
-        Incident number prefix (default: 'INC1')
-    limit : int, optional
-        Maximum number of incidents to fetch (default: None = all)
-        
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with incident_number and sys_created_on columns
-    """
-    # Use text() to properly format the query for SQLAlchemy
-    query = text(f"""
-    SELECT 
-        incident_number,
-        sys_created_on
-    FROM "{table_name}"
-    WHERE data_source = 'gsnow'
-      AND opened_at IS NULL
-      AND incident_number LIKE '{incident_prefix}%'
-    ORDER BY incident_number
-    """)
-    
-    if limit:
-        query = text(f"""
-        SELECT 
-            incident_number,
-            sys_created_on
-        FROM "{table_name}"
-        WHERE data_source = 'gsnow'
-          AND opened_at IS NULL
-          AND incident_number LIKE '{incident_prefix}%'
-        ORDER BY incident_number
-        LIMIT {limit}
-        """)
-    
-    # Use engine.connect() instead of pd.read_sql to avoid parameter issues
-    with engine.connect() as conn:
-        df = pd.read_sql(query, conn)
-    return df
+# ------------------------------------------------------------------------
+# Column Mapping
+# ------------------------------------------------------------------------
+def get_column_mapping():
+    """Define column mapping between Atlas and gsnow sources"""
+    mapping = {
+        "inc_number": "incident_number",
+        "assigned_grp": "assignment_group",
+        "created_on": "sys_created_on",
+        "opened_at": "opened_at",
+        "resolved_at": "resolved_at",
+        "closed_at": "closed_at",
+        "updated_on": "sys_updated_on",
+        "inc_priority": "priority",
+        "severity": "severity",
+        "urgency": "urgency",
+        "business_impact": "business_impact",
+        "operational_impact": "u_operational_impact",
+        "category": "category",
+        "sub-category": "subcategory",
+        "type": "contact_type",
+        "contact_type": "contact_type",
+        "short_description": "short_description",
+        "description": "description",
+        "solution": "close_notes",
+        "service_owner_grp": "business_service",
+        "service_impacted": "cmdb_ci",
+        "service_impacted_id": "cmdb_ci_sys_id",
+        "creator_gpn": "opened_by_gpn",
+        "creator_bus_name": "opened_by_user_name",
+        "impacted_country": "u_impacted_country",
+        "business_cluster": "u_business_cluster",
+        "business_cluster_owner": "u_business_cluster_owner",
+        "business_cluster_owner_gpn": "u_business_cluster_owner_gpn",
+        "service_environment": "u_service_environment",
+        "service_division": "service_division",
+        "service_division_id": "service_division_id",
+        "business_stream": "u_business_stream",
+        "business_stream_prg_mgr": "u_business_stream_prg_mgr",
+        "business_stream_prg_mgr_gpn": "u_business_stream_prg_mgr_gpn",
+        "business_stream_id": "u_business_stream_id",
+        "it_sector": "u_it_sector",
+        "it_sector_cio": "u_it_sector_cio",
+        "solution_domain": "u_solution_domain",
+        "solution_domain_id": "u_solution_domain_id",
+        "solution_domain_mgr": "u_solution_domain_mgr",
+        "solution_domain_mgr_gpn": "u_solution_domain_mgr_gpn",
+        "swci": "swci_id",
+        "swci_id": "swci_id",
+        "swc": "swc",
+        "swc_id": "swc_id",
+        "state": "state",
+        "business_impact_severity": "business_impact",
+        "resolution_sla_name": "made_sla",
+        "response_ola_name": "made_sla",
+        "1st_assigned_grp": "assignment_group",
+        "updated_by_gpn": "sys_updated_by",
+        "resolved_by_name": "resolved_by_user_name",
+        "attached_kb_number": "knowledge",
+        "related_item": "parent",
+        "source_name": "origin_table",
+        "service_type": "type",
+        "technology_bcm_tier": "u_technology_bcm_tier",
+        "bcm_criticality_tier_rating": "u_bcm_criticality_tier_rating",
+    }
+    return mapping
 
-def get_created_on_batch_from_gsnow(session, incident_numbers, batch_size=1000):
-    """
-    Get created_on values from gsnow for multiple incident numbers in batch.
-    Much faster than querying one by one.
+# ------------------------------------------------------------------------
+# Data Fetching Functions
+# ------------------------------------------------------------------------
+def fetch_atlas_data(session, start_date="2024-01-01", end_date=None):
+    """Fetch data from Atlas (IPM Incident Flat) for DH assignment groups"""
+    if end_date is None:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
     
-    Parameters
-    ----------
-    session : pystarburst.Session
-        gsnow session
-    incident_numbers : list
-        List of incident numbers to search
-    batch_size : int
-        Number of incidents to query per batch (default: 1000)
-        
-    Returns
-    -------
-    dict
-        Dictionary mapping incident_number -> created_on datetime
+    print("\n" + "=" * 80)
+    print("📥 FETCHING ATLAS DATA")
+    print("=" * 80)
+    print(f"📅 Period: {start_date} to {end_date} (end exclusive)")
+    
+    catalog = "ipm_service_management"
+    schema = "ipm_service_management_schema"
+    table = "ipm_incident_flat"
+    fqtn = f"{catalog}.{schema}.{table}"
+    date_col = "opened_at"
+    
+    atlas_columns = [
+        "incident_number", "opened_at", "opened_by_user_name", "opened_by_gpn",
+        "closed_at", "resolved_at", "assignment_group", "assignment_group_id",
+        "assigned_to_gpn", "assigned_to_user_name", "caller_gpn", "caller_user_name",
+        "state", "priority", "severity", "category", "subcategory", "short_description",
+        "description", "impact", "urgency", "business_impact", "business_service",
+        "cmdb_ci", "cmdb_ci_sys_id", "location", "company", "active", "incident_state",
+        "reassignment_count", "reopen_count", "time_worked", "business_duration",
+        "calendar_duration", "made_sla", "u_manager_in_charge_gpn",
+        "u_manager_in_charge_user_name", "u_financial_impact", "u_operational_impact",
+        "u_reputational_impact", "u_regulatory_impact", "u_regulators_informed",
+        "u_impacted_country", "sys_created_on", "sys_updated_on", "sys_updated_by",
+        "resolved_by_user_name", "resolved_by_gpn", "close_notes", "knowledge",
+        "parent", "origin_table", "contact_type",
+    ]
+    
+    normalized_expr = f"regexp_replace({date_col}, '(.*)([+-]\\\\d{{2}})(\\\\d{{2}})$', '\\\\1\\\\2:\\\\3')"
+    parse_iso = f"from_iso8601_timestamp({normalized_expr})"
+    
+    col_list_sql = ", ".join([f'"{c}"' for c in atlas_columns])
+    
+    query = f"""
+    SELECT {col_list_sql}
+    FROM {fqtn}
+    WHERE {normalized_expr} IS NOT NULL
+      AND {parse_iso} >= TIMESTAMP '{start_date} 00:00:00'
+      AND {parse_iso} <  TIMESTAMP '{end_date} 00:00:00'
+      AND assignment_group LIKE 'DH-%'
+    ORDER BY {parse_iso} DESC
     """
+    
+    try:
+        print(f"⏳ Fetching Atlas records...")
+        df_atlas = session.sql(query).to_pandas()
+        df_atlas['data_source'] = 'Atlas'
+        print(f"✅ Retrieved {len(df_atlas):,} Atlas records")
+        return df_atlas
+    except Exception as e:
+        print(f"❌ Error fetching Atlas data: {e}")
+        traceback.print_exc()
+        return None
+
+def fetch_gsnow_data(session, start_date="2024-01-01", end_date=None):
+    """Fetch data from gsnow for DH assignment groups"""
+    if end_date is None:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    
+    print("\n" + "=" * 80)
+    print("📥 FETCHING GSNOW DATA")
+    print("=" * 80)
+    print(f"📅 Period: {start_date} to {end_date} (end exclusive)")
+    
     schema = "ts_dwh_gsnow_schema"
     table = "gsnow_inc_main_unstrreq_36mth"
     table_ref = f"{schema}.{table}"
+    date_col = "opened_at"
     
-    result_dict = {}
+    gsnow_columns = [
+        "inc_number", "assigned_grp", "business_impact", "category", "closed_at",
+        "contact_type", "created_on", "opened_at", "operational_impact", "inc_priority",
+        "resolution_sla_name", "resolved_at", "response_ola_name", "service_impacted",
+        "service_impacted_id", "service_owner_grp", "severity", "short_description",
+        "state", "type", "updated_on", "urgency", "creator_bus_name", "creator_gpn",
+        "service_environment", "impacted_country", "description", "sub-category",
+        "ola_created_by_bus_name", "ola_created_by_gpn", "1st_assigned_grp",
+        "updated_by_gpn", "business_impact_severity", "swci", "swci_id", "swc",
+        "swc_id", "bcm_criticality_tier_rating", "solution", "solution_id",
+        "solution_domain_mgr", "solution_domain_mgr_gpn", "solution_domain",
+        "solution_domain_id", "business_cluster_owner", "business_cluster_owner_gpn",
+        "business_cluster", "business_cluster_id", "it_sector_cio", "it_sector",
+        "business_stream_prg_mgr", "business_stream_prg_mgr_gpn", "business_stream",
+        "business_stream_id", "service_division_id", "service_division",
+        "attached_kb_number", "related_item", "source_name", "incremental_field",
+        "ext_name", "service_type", "technology_bcm_tier", "resolved_by_name",
+    ]
     
-    # Process in batches
-    total_batches = (len(incident_numbers) + batch_size - 1) // batch_size
+    col_list_sql = ", ".join([f'"{c}"' for c in gsnow_columns])
     
-    for batch_num in range(total_batches):
-        start_idx = batch_num * batch_size
-        end_idx = min(start_idx + batch_size, len(incident_numbers))
-        batch = incident_numbers[start_idx:end_idx]
+    query = f"""
+    SELECT {col_list_sql}
+    FROM {table_ref}
+    WHERE {date_col} >= DATE '{start_date}'
+      AND {date_col} <  DATE '{end_date}'
+      AND assigned_grp LIKE 'DH-%'
+    ORDER BY {date_col} DESC
+    """
+    
+    try:
+        print(f"⏳ Fetching gsnow records...")
+        df_gsnow = session.sql(query).to_pandas()
+        df_gsnow['data_source'] = 'gsnow'
+        print(f"✅ Retrieved {len(df_gsnow):,} gsnow records")
+        return df_gsnow
+    except Exception as e:
+        print(f"❌ Error fetching gsnow data: {e}")
+        traceback.print_exc()
+        return None
+
+# ------------------------------------------------------------------------
+# Data Merging and Fixing Functions
+# ------------------------------------------------------------------------
+def map_and_combine(df_atlas, df_gsnow):
+    """Map gsnow columns to Atlas columns and combine datasets"""
+    print("\n" + "=" * 80)
+    print("🔄 MAPPING COLUMNS AND COMBINING DATASETS")
+    print("=" * 80)
+    
+    if df_atlas is None and df_gsnow is None:
+        print("❌ No data from either source")
+        return None
+    
+    if df_atlas is None:
+        print("⚠️ Warning: No Atlas data available")
+        return None
+    
+    column_mapping = get_column_mapping()
+    atlas_columns = list(df_atlas.columns)
+    standard_columns = atlas_columns.copy()
+    
+    print(f"📋 Atlas (PRIMARY) columns: {len(standard_columns)}")
+    print(f"✅ Atlas data: {len(df_atlas):,} records")
+    
+    # Process gsnow data - map to Atlas structure
+    if df_gsnow is not None:
+        print(f"✅ gsnow data: {len(df_gsnow):,} records")
+        print("🔄 Mapping gsnow columns to Atlas structure...")
         
-        # Escape single quotes and create IN clause
-        safe_incident_numbers = [inc.replace("'", "''") for inc in batch]
-        in_clause = "', '".join(safe_incident_numbers)
+        df_gsnow_mapped = pd.DataFrame()
+        reverse_mapping = {v: k for k, v in column_mapping.items() if v is not None}
         
-        query = f"""
-        SELECT inc_number, created_on
-        FROM {table_ref}
-        WHERE inc_number IN ('{in_clause}')
+        for atlas_col in standard_columns:
+            if atlas_col == 'data_source':
+                df_gsnow_mapped[atlas_col] = df_gsnow.get('data_source', 'gsnow')
+            elif atlas_col in reverse_mapping:
+                gsnow_col = reverse_mapping[atlas_col]
+                if gsnow_col in df_gsnow.columns:
+                    df_gsnow_mapped[atlas_col] = df_gsnow[gsnow_col]
+                else:
+                    df_gsnow_mapped[atlas_col] = None
+            else:
+                df_gsnow_mapped[atlas_col] = None
+        
+        df_gsnow = df_gsnow_mapped
+        print(f"✅ gsnow columns mapped to Atlas structure")
+    
+    # Combine datasets
+    print(f"\n🔀 Combining datasets...")
+    dataframes = []
+    
+    if df_atlas is not None:
+        dataframes.append(df_atlas[standard_columns])
+        print(f"   📊 Added {len(df_atlas):,} Atlas records (PRIMARY)")
+    
+    if df_gsnow is not None and len(df_gsnow) > 0:
+        dataframes.append(df_gsnow[standard_columns])
+        print(f"   📊 Added {len(df_gsnow):,} gsnow records (supplementary)")
+    
+    if not dataframes:
+        print("❌ No dataframes to combine")
+        return None
+    
+    df_combined = pd.concat(dataframes, ignore_index=True)
+    print(f"✅ Combined dataset: {len(df_combined):,} total records")
+    
+    # Handle duplicates - prioritize Atlas
+    if 'incident_number' in df_combined.columns:
+        initial_count = len(df_combined)
+        df_combined['_priority'] = df_combined['data_source'].map({'Atlas': 1, 'gsnow': 2})
+        df_combined = df_combined.sort_values('_priority').drop_duplicates(
+            subset=['incident_number'], 
+            keep='first'
+        )
+        df_combined = df_combined.drop(columns=['_priority'])
+        removed = initial_count - len(df_combined)
+        if removed > 0:
+            print(f"🔍 Removed {removed:,} duplicate incident_numbers (kept Atlas records)")
+    
+    return df_combined
+
+def fix_opened_at_for_gsnow(df_combined):
+    """Fix NULL opened_at for gsnow records using sys_created_on as fallback"""
+    print("\n" + "=" * 80)
+    print("🔧 FIXING opened_at FOR GSNOW RECORDS")
+    print("=" * 80)
+    
+    if df_combined is None or len(df_combined) == 0:
+        return df_combined
+    
+    if 'opened_at' not in df_combined.columns or 'sys_created_on' not in df_combined.columns:
+        print("⚠️  Missing required columns (opened_at or sys_created_on)")
+        return df_combined
+    
+    # Find gsnow records with NULL opened_at
+    gsnow_mask = (df_combined['data_source'] == 'gsnow') & (df_combined['opened_at'].isna())
+    null_count = gsnow_mask.sum()
+    
+    if null_count > 0:
+        print(f"⚠️  Found {null_count:,} gsnow records with NULL opened_at")
+        print("   Using sys_created_on (from created_on) as fallback...")
+        
+        # Use sys_created_on as fallback for opened_at
+        df_combined.loc[gsnow_mask, 'opened_at'] = df_combined.loc[gsnow_mask, 'sys_created_on']
+        
+        # Count how many were successfully filled
+        filled_count = ((df_combined['data_source'] == 'gsnow') & 
+                       (df_combined['opened_at'].notna()) & 
+                       gsnow_mask).sum()
+        
+        print(f"✅ Filled {filled_count:,} NULL opened_at values with sys_created_on")
+        
+        # Count remaining NULLs
+        remaining_nulls = ((df_combined['data_source'] == 'gsnow') & 
+                          (df_combined['opened_at'].isna())).sum()
+        if remaining_nulls > 0:
+            print(f"⚠️  {remaining_nulls:,} gsnow records still have NULL opened_at (sys_created_on also NULL)")
+    else:
+        print("✅ No gsnow records with NULL opened_at found")
+    
+    return df_combined
+
+# ------------------------------------------------------------------------
+# Categorization Function
+# ------------------------------------------------------------------------
+def categorize_with_category_latest(input_csv, output_csv=None):
+    """Run category_latest.py to categorize the data"""
+    print("\n" + "=" * 80)
+    print("🔍 RUNNING CATEGORIZATION (category_latest.py)")
+    print("=" * 80)
+    
+    # Find category_latest.py script
+    script_dir = Path(__file__).parent.resolve()
+    category_script = None
+    
+    for folder_name in ["Categorise", "categorization", "Categorization"]:
+        potential_path = script_dir / folder_name / "category_latest.py"
+        if potential_path.exists():
+            category_script = potential_path
+            print(f"✅ Found category_latest.py at: {category_script}")
+            break
+    
+    if not category_script:
+        print(f"❌ category_latest.py not found")
+        return None
+    
+    # Use provided output or create temp file
+    if output_csv is None:
+        output_csv = input_csv.replace('.csv', '_categorized.csv')
+    
+    # Build command
+    cmd = [
+        sys.executable,
+        str(category_script),
+        '-i', input_csv,
+        '-o', output_csv,
+        '--use-gpt',
+        '--cluster-categories',
+        '--cluster-method', 'gpt',
+        '--skip-drain3',
+        '--max-workers', '50',
+    ]
+    
+    print(f"🚀 Calling category_latest.py...")
+    print(f"   Input: {input_csv}")
+    print(f"   Output: {output_csv}")
+    
+    try:
+        start_time = datetime.datetime.now()
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8'
+        )
+        elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
+        
+        if result.returncode != 0:
+            print(f"❌ category_latest.py failed with return code {result.returncode}")
+            if result.stderr:
+                print("STDERR:")
+                print(result.stderr[-2000:])  # Last 2000 chars
+            if result.stdout:
+                print("STDOUT (last 2000 chars):")
+                print(result.stdout[-2000:])
+            return None
+        
+        print(f"✅ category_latest.py completed in {elapsed_time:.1f}s")
+        
+        # Load categorized CSV
+        if os.path.exists(output_csv):
+            print(f"📥 Loading categorized data from: {output_csv}")
+            df_categorized = pd.read_csv(output_csv, encoding='utf-8', low_memory=False)
+            print(f"✅ Loaded categorized data: {len(df_categorized):,} rows")
+            return df_categorized
+        else:
+            print(f"❌ Output file not found: {output_csv}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error during categorization: {e}")
+        traceback.print_exc()
+        return None
+
+# ------------------------------------------------------------------------
+# PostgreSQL Functions
+# ------------------------------------------------------------------------
+def infer_postgres_type(series, col_name):
+    """Infer PostgreSQL data type from pandas Series"""
+    non_null = series.dropna()
+    
+    if len(non_null) == 0:
+        return Text
+    
+    if series.dtype == 'bool' or non_null.dtype == 'bool':
+        return Boolean
+    
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return DateTime
+    
+    if pd.api.types.is_integer_dtype(series):
+        if non_null.abs().max() < 2147483647:
+            return Integer
+        else:
+            return BigInteger
+    
+    if pd.api.types.is_float_dtype(series):
+        return Float
+    
+    if series.dtype == 'object':
+        max_length = non_null.astype(str).str.len().max()
+        if max_length > 0 and max_length < 255:
+            return String(max_length + 50)
+        else:
+            return Text
+    
+    return Text
+
+def create_table_from_dataframe(engine, df, table_name, schema='public'):
+    """Create PostgreSQL table from DataFrame with inferred data types"""
+    try:
+        print(f"\n📋 CREATING TABLE: {table_name}")
+        
+        column_types = {}
+        for col in df.columns:
+            pg_type = infer_postgres_type(df[col], col)
+            column_types[col] = pg_type
+        
+        columns_sql = []
+        for col in df.columns:
+            pg_type = column_types[col]
+            
+            if pg_type == Boolean:
+                type_str = "BOOLEAN"
+            elif pg_type == Integer:
+                type_str = "INTEGER"
+            elif pg_type == BigInteger:
+                type_str = "BIGINT"
+            elif pg_type == Float:
+                type_str = "DOUBLE PRECISION"
+            elif pg_type == DateTime:
+                type_str = "TIMESTAMP"
+            elif pg_type == Date:
+                type_str = "DATE"
+            elif isinstance(pg_type, String):
+                type_str = f"VARCHAR({pg_type.length})"
+            else:
+                type_str = "TEXT"
+            
+            col_escaped = f'"{col}"'
+            columns_sql.append(f"{col_escaped} {type_str}")
+        
+        # Add created_at and updated_at
+        columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+        columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+        
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {schema}."{table_name}" (
+            {', '.join(columns_sql)}
+        );
         """
         
-        try:
-            df = session.sql(query).to_pandas()
-            
-            # Map results
-            for _, row in df.iterrows():
-                inc_num = row['inc_number']
-                created_on = row['created_on']
-                if pd.notna(created_on):
-                    result_dict[inc_num] = pd.to_datetime(created_on)
-            
-            if batch_num % 10 == 0 or batch_num == total_batches - 1:
-                logging.info(f"   Processed batch {batch_num + 1}/{total_batches} ({len(result_dict)} found so far)")
-                
-        except Exception as e:
-            logging.warning(f"   ⚠️  Error fetching batch {batch_num + 1}: {e}")
-            # Continue with next batch
-    
-    return result_dict
-
-def update_opened_at_batch_in_postgres(engine, table_name, updates_dict, batch_size=1000):
-    """
-    Update opened_at in PostgreSQL for multiple incidents in batch.
-    Much faster than updating one by one.
-    Only updates records where opened_at IS NULL.
-    
-    Parameters
-    ----------
-    engine : sqlalchemy.engine.Engine
-        SQLAlchemy engine
-    table_name : str
-        Table name
-    updates_dict : dict
-        Dictionary mapping incident_number -> created_on_value
-    batch_size : int
-        Number of updates per batch (default: 1000)
-        
-    Returns
-    -------
-    dict
-        Statistics: {'updated': count, 'failed': count}
-    """
-    results = {'updated': 0, 'failed': 0}
-    
-    if not updates_dict:
-        return results
-    
-    # Convert to list of tuples for batch processing
-    updates_list = list(updates_dict.items())
-    total_batches = (len(updates_list) + batch_size - 1) // batch_size
-    
-    logging.info(f"   Updating {len(updates_list):,} records in {total_batches} batches...")
-    
-    for batch_num in range(total_batches):
-        start_idx = batch_num * batch_size
-        end_idx = min(start_idx + batch_size, len(updates_list))
-        batch = updates_list[start_idx:end_idx]
-        
-        try:
-            # Build batch UPDATE using CASE statement
-            case_statements = []
-            incident_numbers = []
-            
-            for inc_num, created_on_val in batch:
-                # Format datetime
-                if isinstance(created_on_val, pd.Timestamp):
-                    created_on_str = created_on_val.strftime('%Y-%m-%d %H:%M:%S')
-                elif isinstance(created_on_val, datetime):
-                    created_on_str = created_on_val.strftime('%Y-%m-%d %H:%M:%S')
-                else:
-                    created_on_str = str(created_on_val)
-                
-                # Escape single quotes
-                safe_inc_num = inc_num.replace("'", "''")
-                incident_numbers.append(f"'{safe_inc_num}'")
-                case_statements.append(f"WHEN '{safe_inc_num}' THEN CAST('{created_on_str}' AS TIMESTAMP)")
-            
-            in_clause = ", ".join(incident_numbers)
-            case_when = "\n            ".join(case_statements)
-            
-            # Only update records where opened_at IS NULL (skip already updated ones)
-            update_query = text(f"""
-            UPDATE "{table_name}"
-            SET opened_at = CASE incident_number
-                {case_when}
-            END,
-            updated_at = CURRENT_TIMESTAMP
-            WHERE incident_number IN ({in_clause})
-              AND data_source = 'gsnow'
-              AND opened_at IS NULL
-            """)
-            
-            with engine.connect() as conn:
-                result = conn.execute(update_query)
-                rows_updated = result.rowcount
-                conn.commit()
-                results['updated'] += rows_updated
-            
-            if (batch_num + 1) % 10 == 0 or batch_num == total_batches - 1:
-                logging.info(f"   Updated batch {batch_num + 1}/{total_batches} ({results['updated']:,} total updated)")
-                
-        except Exception as e:
-            logging.error(f"   ⚠️  Error updating batch {batch_num + 1}: {e}")
-            logging.error(traceback.format_exc())
-            results['failed'] += len(batch)
-    
-    return results
-
-def update_opened_at_in_postgres(engine, table_name, incident_number, created_on_value):
-    """
-    Update opened_at in PostgreSQL with created_on value.
-    
-    Parameters
-    ----------
-    engine : sqlalchemy.engine.Engine
-        SQLAlchemy engine
-    table_name : str
-        Table name
-    incident_number : str
-        Incident number to update
-    created_on_value : datetime
-        created_on value to use for opened_at
-        
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    try:
-        # Escape single quotes in incident_number for safety
-        safe_incident_number = incident_number.replace("'", "''")
-        
-        # Format the datetime value properly
-        if created_on_value is None:
-            return False
-        
-        # Convert to string format that PostgreSQL understands
-        if isinstance(created_on_value, pd.Timestamp):
-            created_on_str = created_on_value.strftime('%Y-%m-%d %H:%M:%S')
-        elif isinstance(created_on_value, datetime):
-            created_on_str = created_on_value.strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            created_on_str = str(created_on_value)
-        
-        # Use parameterized query with CAST instead of ::timestamp
-        # CAST works better with SQLAlchemy parameters
-        update_query = text(f"""
-        UPDATE "{table_name}"
-        SET opened_at = CAST(:created_on_value AS TIMESTAMP),
-            updated_at = CURRENT_TIMESTAMP
-        WHERE incident_number = :incident_number
-          AND data_source = 'gsnow'
-        """)
-        
         with engine.connect() as conn:
-            # Pass parameters as dictionary (works with both SQLAlchemy 1.4 and 2.0)
-            result = conn.execute(
-                update_query,
-                {
-                    "created_on_value": created_on_str,
-                    "incident_number": incident_number
-                }
-            )
+            conn.execute(text(create_table_sql))
             conn.commit()
-            return result.rowcount > 0
-    except Exception as e:
-        logging.error(f"   ❌ Error updating {incident_number}: {e}")
-        traceback.print_exc()
-        return False
-
-def sync_gsnow_inc1_to_postgres(table_name=None, database=None, 
-                                user=None, host=None, port=None, password=None,
-                                incident_prefix='INC1', limit=None, dry_run=True):
-    """
-    Main function to sync gsnow created_on to PostgreSQL opened_at.
-    
-    Parameters
-    ----------
-    table_name : str, optional
-        Target table name (default: 'incident_data')
-    database : str, optional
-        Database name (default: from config)
-    user : str, optional
-        PostgreSQL username (default: from config)
-    host : str, optional
-        PostgreSQL host (default: from config)
-    port : str, optional
-        PostgreSQL port (default: from config)
-    password : str, optional
-        PostgreSQL password (default: from environment variable)
-    incident_prefix : str, optional
-        Incident number prefix (default: 'INC1')
-    limit : int, optional
-        Maximum number of incidents to process (default: None = all)
-    dry_run : bool, optional
-        If True, only show what would be updated (default: True)
         
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    try:
-        logging.info("="*80)
-        logging.info("🔄 SYNC GSNOW created_on TO POSTGRESQL opened_at")
-        logging.info("="*80)
-        logging.info(f"   Database: {database or POSTGRES_CONFIG['database']}")
-        logging.info(f"   Table: {table_name or POSTGRES_CONFIG['table_name']}")
-        logging.info(f"   Incident prefix: {incident_prefix}")
-        logging.info(f"   Limit: {limit or 'All'}")
-        logging.info(f"   Mode: {'DRY RUN (no changes)' if dry_run else 'LIVE UPDATE'}")
-        logging.info("="*80)
-        
-        # Connect to PostgreSQL
-        table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()
-        database = database or POSTGRES_CONFIG['database']
-        user = user or POSTGRES_CONFIG['user']
-        host = host or POSTGRES_CONFIG['host']
-        port = port or POSTGRES_CONFIG['port']
-        password = password or POSTGRES_CONFIG['password']
-        
-        logging.info(f"\n⏳ Connecting to PostgreSQL...")
-        if password:
-            encoded_password = quote_plus(password)
-            pg_connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
-        else:
-            pg_connection_string = f"postgresql://{user}@{host}:{port}/{database}"
-        
-        pg_engine = create_engine(pg_connection_string, pool_pre_ping=True)
-        
-        with pg_engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logging.info(f"✅ Connected to PostgreSQL")
-        
-        # Connect to gsnow
-        logging.info(f"\n⏳ Connecting to gsnow...")
-        gsnow_session, catalog_name = create_gsnow_session()
-        
-        if not gsnow_session:
-            logging.error("❌ Failed to create gsnow session")
-            pg_engine.dispose()
-            return False
-        
-        logging.info(f"✅ Connected to gsnow catalog: {catalog_name}")
-        
-        # Step 1: Fetch INC1 incidents from PostgreSQL
-        logging.info(f"\n{'='*80}")
-        logging.info("STEP 1: Fetching INC1 incidents from PostgreSQL")
-        logging.info(f"{'='*80}")
-        
-        df_incidents = get_inc1_incidents_from_postgres(
-            pg_engine, 
-            table_name, 
-            incident_prefix=incident_prefix,
-            limit=limit
-        )
-        
-        if len(df_incidents) == 0:
-            logging.info(f"✓ No incidents found with NULL opened_at and prefix '{incident_prefix}'")
-            pg_engine.dispose()
-            return True
-        
-        logging.info(f"✓ Found {len(df_incidents):,} incidents to process")
-        logging.info(f"   Sample incident numbers: {', '.join(df_incidents['incident_number'].head(10).tolist())}")
-        
-        # Step 2: Fetch created_on from gsnow in BATCHES (much faster!)
-        logging.info(f"\n{'='*80}")
-        logging.info("STEP 2: Fetching created_on from gsnow in batches")
-        logging.info(f"{'='*80}")
-        logging.info(f"   Fetching created_on for {len(df_incidents):,} incidents in batches of 1000...")
-        
-        incident_numbers_list = df_incidents['incident_number'].tolist()
-        
-        # Fetch all created_on values in batches
-        created_on_dict = get_created_on_batch_from_gsnow(
-            gsnow_session, 
-            incident_numbers_list,
-            batch_size=1000
-        )
-        
-        logging.info(f"✓ Fetched created_on for {len(created_on_dict):,} incidents from gsnow")
-        
-        # Step 3: Update PostgreSQL in batches
-        logging.info(f"\n{'='*80}")
-        logging.info("STEP 3: Updating PostgreSQL in batches")
-        logging.info(f"{'='*80}")
-        logging.info(f"   Records to update: {len(created_on_dict):,}")
-        logging.info(f"   Note: Only records with opened_at IS NULL will be updated")
-        logging.info(f"   (Already updated records will be skipped)")
-        
-        results = {
-            'total': len(df_incidents),
-            'found_in_gsnow': len(created_on_dict),
-            'not_found_in_gsnow': len(df_incidents) - len(created_on_dict),
-            'updated': 0,
-            'failed': 0,
-            'skipped': 0
-        }
-        
-        # Filter out incidents not found in gsnow
-        incidents_to_update = {k: v for k, v in created_on_dict.items() if v is not None}
-        
-        if not dry_run and incidents_to_update:
-            # Update in batches
-            update_results = update_opened_at_batch_in_postgres(
-                pg_engine,
-                table_name,
-                incidents_to_update,
-                batch_size=1000
-            )
-            results['updated'] = update_results['updated']
-            results['failed'] = update_results['failed']
-        else:
-            # Dry run - just count
-            results['skipped'] = len(incidents_to_update)
-        
-        # Summary
-        logging.info(f"\n{'='*80}")
-        logging.info("✅ SYNC COMPLETED")
-        logging.info(f"{'='*80}")
-        logging.info(f"📊 Summary:")
-        logging.info(f"   Total incidents processed: {results['total']:,}")
-        logging.info(f"   Found in gsnow: {results['found_in_gsnow']:,}")
-        logging.info(f"   Not found in gsnow: {results['not_found_in_gsnow']:,}")
-        
-        if dry_run:
-            logging.info(f"   Would update: {results['skipped']:,}")
-            logging.info(f"\n   Run with --execute to apply changes")
-        else:
-            logging.info(f"   Successfully updated: {results['updated']:,}")
-            logging.info(f"   Failed to update: {results['failed']:,}")
-        
-        logging.info(f"{'='*80}\n")
-        
-        pg_engine.dispose()
+        print(f"✅ Table '{table_name}' created successfully")
         return True
         
     except Exception as e:
-        logging.error(f"\n✗ Failed to sync: {e}")
-        logging.error(traceback.format_exc())
+        print(f"❌ Error creating table: {e}")
+        traceback.print_exc()
+        return False
+
+def load_to_postgresql(df, table_name='incident_data', database='service_automation_db', truncate=True):
+    """Load DataFrame to PostgreSQL table"""
+    if not POSTGRES_AVAILABLE:
+        print("❌ PostgreSQL libraries not available")
+        return False
+    
+    if df is None or len(df) == 0:
+        print("❌ No data to load")
+        return False
+    
+    print("\n" + "=" * 80)
+    print("💾 LOADING DATA TO POSTGRESQL")
+    print("=" * 80)
+    
+    pg_host = POSTGRES_CONFIG['host']
+    pg_port = POSTGRES_CONFIG['port']
+    pg_db = database or POSTGRES_CONFIG['database']
+    pg_user = POSTGRES_CONFIG['user']
+    pg_password = POSTGRES_CONFIG['password']
+    
+    try:
+        encoded_password = quote_plus(pg_password)
+        connection_string = f"postgresql://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_db}"
+        
+        print(f"📊 Database: {pg_db}")
+        print(f"📋 Table: {table_name}")
+        print(f"📈 Rows to insert: {len(df):,}")
+        
+        engine = create_engine(connection_string, pool_pre_ping=True)
+        
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✅ Connected to PostgreSQL")
+        
+        # Check if table exists (case-sensitive check)
+        with engine.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = 'public' 
+                    AND table_name = '{table_name}'
+                );
+            """))
+            table_exists = result.fetchone()[0]
+        
+        if not table_exists:
+            print(f"⚠️  Table '{table_name}' does not exist. Creating it...")
+            success = create_table_from_dataframe(engine, df, table_name)
+            if not success:
+                engine.dispose()
+                return False
+        else:
+            print(f"✅ Table '{table_name}' exists")
+        
+        # Truncate table FIRST (clean the table)
+        if truncate:
+            print(f"\n🧹 CLEANING TABLE: Truncating '{table_name}'...")
+            with engine.connect() as conn:
+                conn.execute(text(f'TRUNCATE TABLE "{table_name}" CASCADE;'))
+                conn.commit()
+            print(f"✅ Table '{table_name}' cleaned (truncated)")
+        
+        # Get table columns after truncate
+        inspector = inspect(engine)
+        table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
+        
+        # Prepare DataFrame - match column names
+        df_to_insert = df.copy()
+        table_columns_lower = {col.lower(): col for col in table_columns}
+        
+        column_mapping = {}
+        for df_col in df_to_insert.columns:
+            df_col_lower = df_col.lower()
+            if df_col_lower in table_columns_lower:
+                table_col = table_columns_lower[df_col_lower]
+                if df_col != table_col:
+                    column_mapping[df_col] = table_col
+        
+        if column_mapping:
+            df_to_insert.rename(columns=column_mapping, inplace=True)
+        
+        # Filter to only table columns (excluding metadata)
+        metadata_cols = {'created_at', 'updated_at'}
+        columns_to_insert = [col for col in table_columns if col not in metadata_cols]
+        df_to_insert = df_to_insert[[col for col in columns_to_insert if col in df_to_insert.columns]].copy()
+        
+        # Insert data with progress bar
+        print(f"\n⏳ Inserting {len(df_to_insert):,} rows...")
+        total_rows = len(df_to_insert)
+        chunksize = 1000
+        
+        try:
+            from tqdm import tqdm
+            with tqdm(total=total_rows, desc="Inserting", unit="row", unit_scale=True) as pbar:
+                for i in range(0, total_rows, chunksize):
+                    chunk_df = df_to_insert.iloc[i:i+chunksize]
+                    chunk_df.to_sql(
+                        name=table_name,
+                        con=engine,
+                        schema='public',
+                        if_exists='append',
+                        index=False,
+                        method='multi',
+                        chunksize=chunksize
+                    )
+                    pbar.update(len(chunk_df))
+        except ImportError:
+            # Fallback without progress bar
+            df_to_insert.to_sql(
+                name=table_name,
+                con=engine,
+                schema='public',
+                if_exists='append',
+                index=False,
+                method='multi',
+                chunksize=chunksize
+            )
+        
+        print(f"✅ Successfully inserted {len(df_to_insert):,} rows")
+        
+        # Verify
+        with engine.connect() as conn:
+            result = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"'))
+            count = result.fetchone()[0]
+            print(f"✅ Verified: {count:,} rows in table")
+        
+        engine.dispose()
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error loading to PostgreSQL: {e}")
+        traceback.print_exc()
+        return False
+
+# ------------------------------------------------------------------------
+# Main Pipeline Function
+# ------------------------------------------------------------------------
+def run_complete_pipeline(start_date="2024-01-01", end_date=None, 
+                         output_csv=None, table_name='Incident_Data',
+                         truncate_table=True, skip_categorization=False):
+    """
+    Complete pipeline: Fetch -> Merge -> Fix -> Export -> Categorize -> Load to DB
+    """
+    print("=" * 80)
+    print("🚀 COMPLETE INCIDENT DATA PIPELINE")
+    print("=" * 80)
+    print(f"📅 Date range: {start_date} to {end_date or 'current'}")
+    print(f"📊 Output CSV: {output_csv or 'auto-generated'}")
+    print(f"💾 PostgreSQL table: {table_name}")
+    print("=" * 80)
+    
+    try:
+        # Step 1: Connect to databases
+        print("\n" + "=" * 80)
+        print("STEP 1: CONNECTING TO DATABASES")
+        print("=" * 80)
+        
+        print("\n📡 Connecting to Atlas...")
+        atlas_session, atlas_catalog = create_atlas_session()
+        if not atlas_session:
+            print("❌ Failed to connect to Atlas")
+            return False
+        print(f"✅ Connected to Atlas: {atlas_catalog}")
+        
+        print("\n📡 Connecting to gsnow...")
+        gsnow_session, gsnow_catalog = create_gsnow_session()
+        if not gsnow_session:
+            print("❌ Failed to connect to gsnow")
+            return False
+        print(f"✅ Connected to gsnow: {gsnow_catalog}")
+        
+        # Step 2: Fetch data
+        print("\n" + "=" * 80)
+        print("STEP 2: FETCHING DATA FROM ATLAS AND GSNOW")
+        print("=" * 80)
+        
+        df_atlas = fetch_atlas_data(atlas_session, start_date, end_date)
+        df_gsnow = fetch_gsnow_data(gsnow_session, start_date, end_date)
+        
+        # Step 3: Merge and combine
+        print("\n" + "=" * 80)
+        print("STEP 3: MERGING DATASETS")
+        print("=" * 80)
+        
+        df_combined = map_and_combine(df_atlas, df_gsnow)
+        if df_combined is None:
+            print("❌ Failed to combine data")
+            return False
+        
+        # Step 4: Fix opened_at for gsnow records
+        print("\n" + "=" * 80)
+        print("STEP 4: FIXING opened_at FOR GSNOW RECORDS")
+        print("=" * 80)
+        
+        df_combined = fix_opened_at_for_gsnow(df_combined)
+        
+        # Step 5: Export to CSV
+        print("\n" + "=" * 80)
+        print("STEP 5: EXPORTING TO CSV")
+        print("=" * 80)
+        
+        if output_csv is None:
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_csv = f"incidents_merged_{timestamp}.csv"
+        
+        print(f"💾 Saving to: {output_csv}")
+        df_combined.to_csv(output_csv, index=False, encoding='utf-8')
+        print(f"✅ Exported {len(df_combined):,} rows to {output_csv}")
+        
+        # Step 6: Categorize (if not skipped)
+        df_categorized = None
+        categorized_csv = None
+        
+        if not skip_categorization:
+            categorized_csv = output_csv.replace('.csv', '_categorized.csv')
+            df_categorized = categorize_with_category_latest(output_csv, categorized_csv)
+            
+            if df_categorized is None:
+                print("⚠️  Categorization failed, using original data")
+                df_categorized = df_combined
+                categorized_csv = output_csv
+        else:
+            print("\n⏭️  Skipping categorization (--skip-categorization)")
+            df_categorized = df_combined
+            categorized_csv = output_csv
+        
+        # Step 7: Load to PostgreSQL
+        print("\n" + "=" * 80)
+        print("STEP 7: LOADING TO POSTGRESQL")
+        print("=" * 80)
+        
+        success = load_to_postgresql(
+            df_categorized,
+            table_name=table_name,
+            truncate=truncate_table
+        )
+        
+        if success:
+            print("\n" + "=" * 80)
+            print("✅ PIPELINE COMPLETED SUCCESSFULLY")
+            print("=" * 80)
+            print(f"📊 Total records processed: {len(df_categorized):,}")
+            print(f"📁 Merged CSV: {output_csv}")
+            if categorized_csv != output_csv:
+                print(f"📁 Categorized CSV: {categorized_csv}")
+            print(f"💾 PostgreSQL table: {table_name}")
+            print("=" * 80)
+            return True
+        else:
+            print("\n❌ Pipeline failed at PostgreSQL loading step")
+            return False
+            
+    except Exception as e:
+        print(f"\n❌ Pipeline failed: {e}")
+        traceback.print_exc()
         return False
 
 def main():
-    """Main execution function."""
+    """Main execution function"""
     import argparse
     
-    setup_logging()
-    
     parser = argparse.ArgumentParser(
-        description='Sync gsnow created_on to PostgreSQL opened_at for INC1 incidents',
+        description='Complete Incident Data Pipeline: Fetch -> Merge -> Fix -> Categorize -> Load to DB',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Flow:
-1. Fetch INC1 incident numbers from PostgreSQL (where opened_at is NULL)
-2. For each incident, search in gsnow
-3. Pull created_on from gsnow
-4. Update opened_at in PostgreSQL with created_on value
+1. Pull data from Atlas and gsnow (2024 to current)
+2. Merge them properly (Atlas PRIMARY, gsnow supplementary)
+3. Fix opened_at issue (use created_on as fallback for gsnow)
+4. Export to CSV
+5. Run categorization script (category_latest.py) with GPT clustering
+6. Load categorized data to PostgreSQL
 
 Examples:
-  # Dry run (show what would be updated, no changes)
-  python sync_gsnow_inc1_to_postgres.py
+  # Full pipeline with default settings
+  python complete_incident_pipeline.py
   
-  # Dry run with limit
-  python sync_gsnow_inc1_to_postgres.py --limit 100
+  # Custom date range
+  python complete_incident_pipeline.py --start-date 2024-06-01 --end-date 2024-12-31
   
-  # Execute the update
-  python sync_gsnow_inc1_to_postgres.py --execute
+  # Skip categorization
+  python complete_incident_pipeline.py --skip-categorization
   
-  # Execute with custom prefix and limit
-  python sync_gsnow_inc1_to_postgres.py --execute --prefix INC2 --limit 500
-
-Environment variables (optional):
-  PGHOST=localhost
-  PGPORT=5432
-  PGDATABASE=service_automation_db
-  PGUSER=postgres
-  PGPASSWORD=your_password
+  # Custom output file and table
+  python complete_incident_pipeline.py --output my_data.csv --table my_table
         """
     )
     
-    parser.add_argument('--execute', action='store_true',
-                       help='Execute the update (default: dry run mode)')
-    parser.add_argument('--table', type=str, default=None,
-                       help='Table name (default: incident_data)')
-    parser.add_argument('--database', type=str, default=None,
-                       help='Database name (default: from config)')
-    parser.add_argument('--prefix', type=str, default='INC1',
-                       help='Incident number prefix (default: INC1)')
-    parser.add_argument('--limit', type=int, default=None,
-                       help='Maximum number of incidents to process (default: all)')
+    parser.add_argument('--start-date', type=str, default='2024-01-01',
+                       help='Start date (YYYY-MM-DD, default: 2024-01-01)')
+    parser.add_argument('--end-date', type=str, default=None,
+                       help='End date (YYYY-MM-DD, default: current date)')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output CSV file path (default: auto-generated)')
+    parser.add_argument('--table', type=str, default='Incident_Data',
+                       help='PostgreSQL table name (default: Incident_Data)')
+    parser.add_argument('--no-truncate', action='store_true',
+                       help='Do not truncate table before inserting (default: truncate)')
+    parser.add_argument('--skip-categorization', action='store_true',
+                       help='Skip categorization step (default: run categorization)')
     
     args = parser.parse_args()
     
-    # Sync
-    success = sync_gsnow_inc1_to_postgres(
+    success = run_complete_pipeline(
+        start_date=args.start_date,
+        end_date=args.end_date,
+        output_csv=args.output,
         table_name=args.table,
-        database=args.database,
-        incident_prefix=args.prefix,
-        limit=args.limit,
-        dry_run=not args.execute
+        truncate_table=not args.no_truncate,
+        skip_categorization=args.skip_categorization
     )
     
     if success:
