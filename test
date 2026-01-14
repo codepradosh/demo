@@ -117,7 +117,8 @@ def get_inc1_incidents_from_postgres(engine, table_name, incident_prefix='INC1',
     pd.DataFrame
         DataFrame with incident_number and sys_created_on columns
     """
-    query = f"""
+    # Use text() to properly format the query for SQLAlchemy
+    query = text(f"""
     SELECT 
         incident_number,
         sys_created_on
@@ -126,12 +127,24 @@ def get_inc1_incidents_from_postgres(engine, table_name, incident_prefix='INC1',
       AND opened_at IS NULL
       AND incident_number LIKE '{incident_prefix}%'
     ORDER BY incident_number
-    """
+    """)
     
     if limit:
-        query += f" LIMIT {limit}"
+        query = text(f"""
+        SELECT 
+            incident_number,
+            sys_created_on
+        FROM "{table_name}"
+        WHERE data_source = 'gsnow'
+          AND opened_at IS NULL
+          AND incident_number LIKE '{incident_prefix}%'
+        ORDER BY incident_number
+        LIMIT {limit}
+        """)
     
-    df = pd.read_sql(query, engine)
+    # Use engine.connect() instead of pd.read_sql to avoid parameter issues
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
     return df
 
 def get_created_on_from_gsnow(session, incident_number):
