@@ -17,7 +17,8 @@ from urllib.parse import quote_plus
 # PostgreSQL client
 try:
     import psycopg2
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine, text, inspect
+    from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
@@ -45,15 +46,180 @@ POSTGRES_CONFIG = {
     'database': os.getenv('PGDATABASE', 'service_automation_db'),
     'user': os.getenv('PGUSER', 'powerbi_user'),
     'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'Incident_Data'
+    'table_name': 'incident_data'  # Changed to lowercase incident_data
 }
+
+# ------------------------------------------------------------------------
+# Data Type Inference
+# ------------------------------------------------------------------------
+def infer_postgres_type(series, col_name):
+    """
+    Infer PostgreSQL data type from pandas Series.
+    
+    Parameters
+    ----------
+    series : pd.Series
+        The pandas Series to analyze
+    col_name : str
+        Column name (for special handling)
+    
+    Returns
+    -------
+    sqlalchemy.types.TypeEngine
+        SQLAlchemy type for PostgreSQL
+    """
+    # Remove null values for type inference
+    non_null = series.dropna()
+    
+    if len(non_null) == 0:
+        # All nulls - default to Text
+        return Text
+    
+    # Check for boolean
+    if series.dtype == 'bool' or non_null.dtype == 'bool':
+        return Boolean
+    
+    # Check for datetime
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return DateTime
+    
+    # Check for date
+    if pd.api.types.is_datetime64_any_dtype(series) and 'date' in col_name.lower():
+        # Try to parse as date if it's a date column
+        try:
+            pd.to_datetime(non_null.iloc[0])
+            return Date
+        except:
+            pass
+    
+    # Check for integer
+    if pd.api.types.is_integer_dtype(series):
+        # Check if values fit in regular integer or need bigint
+        if non_null.abs().max() < 2147483647:  # PostgreSQL INTEGER max
+            return Integer
+        else:
+            return BigInteger
+    
+    # Check for float
+    if pd.api.types.is_float_dtype(series):
+        return Float
+    
+    # Check if numeric string can be converted to int
+    if series.dtype == 'object':
+        # Try to convert to numeric
+        try:
+            numeric_series = pd.to_numeric(non_null, errors='coerce')
+            if numeric_series.notna().sum() == len(non_null):
+                # All values are numeric
+                if numeric_series.abs().max() < 2147483647:
+                    return Integer
+                else:
+                    return BigInteger
+        except:
+            pass
+    
+    # Check string length for VARCHAR vs TEXT
+    if series.dtype == 'object':
+        max_length = non_null.astype(str).str.len().max()
+        if max_length > 0 and max_length < 255:
+            # Use VARCHAR with some buffer
+            return String(max_length + 50)  # Add 50 char buffer
+        else:
+            return Text
+    
+    # Default to Text
+    return Text
+
+def create_table_from_dataframe(engine, df, table_name, schema='public'):
+    """
+    Create PostgreSQL table from DataFrame with inferred data types.
+    
+    Parameters
+    ----------
+    engine : sqlalchemy.engine.Engine
+        SQLAlchemy engine
+    df : pd.DataFrame
+        DataFrame to create table from
+    table_name : str
+        Table name (will be created in lowercase)
+    schema : str
+        Schema name (default: 'public')
+    
+    Returns
+    -------
+    bool
+        True if successful, False otherwise
+    """
+    try:
+        logging.info(f"\n{'='*80}")
+        logging.info(f"📋 CREATING TABLE: {table_name}")
+        logging.info(f"{'='*80}")
+        
+        # Infer column types
+        column_types = {}
+        for col in df.columns:
+            pg_type = infer_postgres_type(df[col], col)
+            column_types[col] = pg_type
+            logging.info(f"   {col}: {pg_type}")
+        
+        # Build CREATE TABLE SQL
+        columns_sql = []
+        for col in df.columns:
+            pg_type = column_types[col]
+            
+            # Convert SQLAlchemy type to PostgreSQL type string
+            if pg_type == Boolean:
+                type_str = "BOOLEAN"
+            elif pg_type == Integer:
+                type_str = "INTEGER"
+            elif pg_type == BigInteger:
+                type_str = "BIGINT"
+            elif pg_type == Float:
+                type_str = "DOUBLE PRECISION"
+            elif pg_type == DateTime:
+                type_str = "TIMESTAMP"
+            elif pg_type == Date:
+                type_str = "DATE"
+            elif isinstance(pg_type, String):
+                type_str = f"VARCHAR({pg_type.length})"
+            else:
+                type_str = "TEXT"
+            
+            # Escape column name if needed
+            col_escaped = f'"{col}"'
+            columns_sql.append(f"{col_escaped} {type_str}")
+        
+        # Add created_at and updated_at timestamps
+        columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+        columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+        
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {schema}."{table_name}" (
+            {', '.join(columns_sql)}
+        );
+        """
+        
+        logging.info(f"\n⏳ Creating table '{table_name}'...")
+        with engine.connect() as conn:
+            conn.execute(text(create_table_sql))
+            conn.commit()
+        
+        logging.info(f"✅ Table '{table_name}' created successfully")
+        logging.info(f"   Columns: {len(df.columns) + 2} (including created_at, updated_at)")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Error creating table: {e}")
+        logging.error(traceback.format_exc())
+        return False
 
 # ------------------------------------------------------------------------
 # Main Function
 # ------------------------------------------------------------------------
 def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
                                  user=None, host=None, port=None, password=None,
-                                 truncate=False):
+                                 truncate=False, create_table=True):
     """
     Push categorized incident CSV file to PostgreSQL table.
     
@@ -90,7 +256,7 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         return False
     
     # Use provided values or fall back to config/environment
-    table_name = table_name or POSTGRES_CONFIG['table_name']
+    table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()  # Ensure lowercase
     database = database or POSTGRES_CONFIG['database']
     user = user or POSTGRES_CONFIG['user']
     host = host or POSTGRES_CONFIG['host']
@@ -107,27 +273,33 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         logging.info(f"   Host: {host}:{port}")
         logging.info(f"   User: {user}")
         logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
+        logging.info(f"   Create table: {create_table}")
         logging.info("="*80)
         
         # Read CSV file
         logging.info(f"\n⏳ Reading CSV file...")
         try:
-            df = pd.read_csv(csv_file_path, encoding='utf-8')
+            df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
         except UnicodeDecodeError:
             try:
-                df = pd.read_csv(csv_file_path, encoding='latin-1')
+                df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
             except:
-                df = pd.read_csv(csv_file_path, encoding='cp1252')
+                df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
         
         logging.info(f"✓ Read {len(df):,} rows from CSV")
         logging.info(f"✓ Columns: {len(df.columns)} ({', '.join(df.columns[:5])}...)")
         
         # Convert date columns to datetime if they're strings
-        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on']
-        for col in date_columns:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-                logging.info(f"✓ Converted {col} to datetime")
+        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
+                        'created_on', 'updated_on', 'opened_date', 'closed_date']
+        for col in df.columns:
+            if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
+                if df[col].dtype == 'object':
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                        logging.info(f"✓ Converted {col} to datetime")
+                    except:
+                        pass
         
         # Convert boolean columns
         bool_columns = ['active', 'made_sla']
@@ -162,35 +334,28 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         
         # Check if table exists
         logging.info(f"\n⏳ Checking if table '{table_name}' exists...")
-        with engine.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = '{table_name}'
-                );
-            """))
-            table_exists = result.fetchone()[0]
+        inspector = inspect(engine)
+        table_exists = inspector.has_table(table_name, schema='public')
         
         if not table_exists:
-            logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
-            logging.error(f"  Please create the table first.")
-            engine.dispose()
-            return False
-        
-        logging.info(f"✓ Table '{table_name}' exists")
+            if create_table:
+                logging.info(f"⚠️  Table '{table_name}' does not exist. Creating it...")
+                success = create_table_from_dataframe(engine, df, table_name)
+                if not success:
+                    logging.error(f"✗ Failed to create table '{table_name}'")
+                    engine.dispose()
+                    return False
+            else:
+                logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
+                logging.error(f"  Use --create-table to create it automatically")
+                engine.dispose()
+                return False
+        else:
+            logging.info(f"✓ Table '{table_name}' exists")
         
         # Get table column names
         logging.info(f"\n⏳ Fetching table column names...")
-        with engine.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT column_name 
-                FROM information_schema.columns
-                WHERE table_name = '{table_name}'
-                AND table_schema = 'public'
-                ORDER BY ordinal_position;
-            """))
-            table_columns = [row[0] for row in result.fetchall()]
+        table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
         
         col_count = len(table_columns)
         logging.info(f"✓ Table has {col_count} columns")
@@ -330,9 +495,11 @@ Or use .pgpass file for password-less authentication
     parser.add_argument('--truncate', action='store_true', 
                        help='Truncate table before inserting (overwrite mode)')
     parser.add_argument('--table', type=str, default=None,
-                       help='Table name (default: Incident_Data)')
+                       help='Table name (default: incident_data, will be lowercase)')
     parser.add_argument('--database', type=str, default=None,
                        help='Database name (default: from config)')
+    parser.add_argument('--no-create-table', action='store_true',
+                       help='Do not create table if it does not exist (default: auto-create)')
     
     args = parser.parse_args()
     
@@ -346,7 +513,8 @@ Or use .pgpass file for password-less authentication
         args.csv_file,
         table_name=args.table,
         database=args.database,
-        truncate=args.truncate
+        truncate=args.truncate,
+        create_table=not args.no_create_table
     )
     
     if success:
