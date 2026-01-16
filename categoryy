@@ -138,6 +138,26 @@ class ExtractAndCategorize:
         # Map and combine
         df_combined = self.extractor.map_and_combine(df_atlas, df_gsnow)
         
+        # CLEANING: Filter invalid incident numbers
+        if 'incident_number' in df_combined.columns:
+            initial_count = len(df_combined)
+            print(f"   🧹 Validating {initial_count:,} records...")
+            
+            # 1. Drop empty/NaN incident numbers
+            df_combined = df_combined.dropna(subset=['incident_number'])
+            
+            # 2. Keep only rows starting with 'INC'
+            valid_mask = df_combined['incident_number'].astype(str).str.startswith('INC')
+            df_combined = df_combined[valid_mask]
+            
+            final_count = len(df_combined)
+            dropped = initial_count - final_count
+            if dropped > 0:
+                print(f"      - Dropped {dropped:,} invalid records (missing or not starting with INC)")
+            print(f"   ✅ Data validation passed. Count: {final_count:,}")
+        else:
+            print("⚠️ Warning: 'incident_number' column not found, skipping validation")
+        
         if df_combined is None:
             print("❌ Failed to combine data")
             return None
