@@ -1,0 +1,2761 @@
+#!/usr/bin/env python3
+"""
+Initial Load: Extract 2-Year Data, Categorize, and Load to PostgreSQL
+Fetches data from Atlas and gsnow (2024 to current), categorizes it using category_latest.py, 
+and directly inserts into PostgreSQL. Uses temporary CSV files for categorization.
+"""
+
+import os
+import sys
+import json
+import pandas as pd
+import numpy as np
+import urllib3
+import datetime
+import traceback
+import re
+import hashlib
+import time
+import subprocess
+import tempfile
+from pathlib import Path
+from urllib.parse import quote_plus
+from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pystarburst import Session
+from trino.auth import OAuth2Authentication
+from sqlalchemy import create_engine, text
+from tqdm import tqdm
+
+# Disable SSL warnings
+urllib3.disable_warnings()
+
+# PostgreSQL imports
+try:
+    import psycopg2
+    POSTGRES_AVAILABLE = True
+except ImportError:
+    POSTGRES_AVAILABLE = False
+    print("Warning: PostgreSQL libraries not available. Install with: pip install psycopg2-binary sqlalchemy")
+
+# ML/Categorization imports (from category_latest.py)
+try:
+    from yake import KeywordExtractor
+    YAKE_AVAILABLE = True
+except ImportError:
+    YAKE_AVAILABLE = False
+    print("Warning: YAKE not available. Install with: pip install yake")
+
+try:
+    from openai import AzureOpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("Warning: OpenAI library not found. GPT categorization will be disabled. Install with: pip install openai")
+
+try:
+    from drain3 import TemplateMiner
+    from drain3.template_miner_config import TemplateMinerConfig
+    from rapidfuzz import fuzz
+    DRAIN3_AVAILABLE = True
+except ImportError:
+    DRAIN3_AVAILABLE = False
+    print("Warning: Drain3/RapidFuzz not available. Template mining will be disabled. Install with: pip install drain3 rapidfuzz")
+
+# Azure OpenAI Configuration (from category_latest.py)
+AZURE_ENDPOINT = "https://dh-automation-1.openai.azure.com/openai/v1"
+AZURE_API_VERSION = "2024-02-15-preview"
+GPT_MODEL = "gpt-4o-mini"
+AZURE_API_KEY = os.getenv('AZURE_OPENAI_API_KEY', '')  # Get from environment variable
+
+# Global cache for GPT responses
+gpt_cache = {}
+from threading import Lock
+gpt_cache_lock = Lock()
+
+
+class InitialLoadIncidents:
+    """Extracts 2-year data from Atlas and gsnow, categorizes it, and loads directly to PostgreSQL"""
+    
+    # Hardcoded connection details for Atlas (IPM Service Management)
+    ATLAS_CONNECTION_DETAILS = [
+        {
+            "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType={LDAP Authentication};SSL=1",
+            "catalogName": "ipm_service_management",
+            "schemaName": "ipm_service_management_schema",
+            "tableName": "ipm_incident_flat",
+            "dataproductId": "281244d9-2e0f-4c77-ba20-964da41911b1",
+            "outputportId": "df9f6069-8ea1-4f0d-b01a-76e5ba693ca6"
+        }
+    ]
+    
+    # Hardcoded connection details for gsnow
+    GSNOW_CONNECTION_DETAILS = [
+        {
+            "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType=LDAP Authentication;SSL=1",
+            "catalogName": "ts_dwh_gsnow",
+            "schemaName": "ts_dwh_gsnow_schema",
+            "tableName": "gsnow_inc_main_unstrreq_36mth",
+            "dataproductId": "72567983-5ac4-405b-a6f8-6b9bd79244fe",
+            "outputportId": "1709c349-7dae-492f-934e-2ce4bb5c5870"
+        }
+    ]
+    
+    def __init__(self, project_source=None, use_env_vars=True):
+        """Initialize the combiner"""
+        self.atlas_session = None
+        self.gsnow_session = None
+        self.atlas_catalog_name = None
+        self.gsnow_catalog_name = None
+        self.project_source = project_source or os.getenv("PROJECT_SOURCE")
+        self.use_env_vars = use_env_vars
+
+        # ------------------------------------------------------------------
+        # Extraction window + exclusions (defaults: 2024-01-01 to current date, DH only,
+        # including ALL creators (manual + automated). Optional exclusions
+        # can be configured via environment variables if needed.
+        #
+        # You can override via environment variables:
+        # - START_DATE: e.g. "2024-01-01"
+        # - END_DATE:   e.g. "2026-01-01" (exclusive) - defaults to current date
+        # - EXCLUDE_OPENED_BY_USERNAMES: comma-separated lower/any-case names
+        # - EXCLUDE_GSNOW_CREATOR_BUS_NAMES: comma-separated lower/any-case names
+        # ------------------------------------------------------------------
+        self.start_date = os.getenv("START_DATE", "2024-01-01")
+        # Default end_date to current date if not specified
+        default_end = datetime.datetime.now().strftime("%Y-%m-%d")
+        self.end_date = os.getenv("END_DATE", default_end)  # exclusive end
+
+        self.exclude_opened_by_usernames = [
+            s.strip().lower()
+            for s in os.getenv("EXCLUDE_OPENED_BY_USERNAMES", "").split(",")
+            if s.strip()
+        ]
+        self.exclude_gsnow_creator_bus_names = [
+            s.strip().lower()
+            for s in os.getenv("EXCLUDE_GSNOW_CREATOR_BUS_NAMES", "").split(",")
+            if s.strip()
+        ]
+        
+        # Load environment variables if requested
+        if self.use_env_vars and self.project_source:
+            load_dotenv(os.path.join(self.project_source, "env"), override=True)
+        
+        print("✅ Atlas/Gsnow Combiner initialized")
+        print(f"📁 Project source: {self.project_source}")
+        print(f"🔧 Using environment variables: {self.use_env_vars}")
+        print(f"📅 Date window: {self.start_date} to {self.end_date} (end exclusive)")
+        print(f"🚫 Excluding Atlas opened_by_user_name: {self.exclude_opened_by_usernames or 'None'}")
+        print(f"🚫 Excluding gsnow creator_bus_name: {self.exclude_gsnow_creator_bus_names or 'None'}")
+    
+    def create_atlas_session(self):
+        """Create PyStarburst session for IPM Service Management catalog (Atlas)"""
+        connection_details = None
+        
+        # Try environment variables first if enabled
+        if self.use_env_vars:
+            try:
+                connection_details = json.loads(os.getenv("CONNECTION_DETAILS"))
+                print("✅ Using connection details from environment variables")
+            except Exception as e:
+                print(f"⚠️ Environment variables not available: {e}")
+                print("🔄 Falling back to hardcoded Atlas connection details")
+                connection_details = None
+        
+        # Use hardcoded connection details as fallback
+        if connection_details is None:
+            connection_details = self.ATLAS_CONNECTION_DETAILS
+            print("✅ Using hardcoded Atlas connection details")
+        
+        session = None
+        current_host = None
+        catalog_name = None
+        
+        # Find the IPM Service Management catalog connection (Atlas)
+        for platform_connection_info in connection_details:
+            # Look for ipm_service_management catalog
+            if platform_connection_info.get("catalogName") == "ipm_service_management":
+                connection_string_list = platform_connection_info["connectionString"].split(";")
+                catalog_name = platform_connection_info["catalogName"]
+                
+                starburst_connection_details = {}
+                for elem in connection_string_list:
+                    if "=" in elem:
+                        key, value = elem.split("=", 1)
+                        starburst_connection_details[key.strip()] = value.strip()
+                
+                host = starburst_connection_details.get("Host")
+                port = starburst_connection_details.get("Port", "443")
+                
+                if current_host != host:
+                    current_host = host
+                    db_parameters = {
+                        "host": current_host,
+                        "port": port,
+                        "http_scheme": "https",
+                        "verify": False,
+                        "auth": OAuth2Authentication(),
+                        "catalog": catalog_name
+                    }
+                    session = Session.builder.configs(db_parameters).create()
+                    break
+        
+        return session, catalog_name
+    
+    def create_gsnow_session(self):
+        """Create PyStarburst session for ts_dwh_gsnow catalog"""
+        connection_details = None
+        
+        # Try environment variables first if enabled
+        if self.use_env_vars:
+            try:
+                connection_details = json.loads(os.getenv("CONNECTION_DETAILS"))
+                print("✅ Using connection details from environment variables")
+            except Exception as e:
+                print(f"⚠️ Environment variables not available: {e}")
+                print("🔄 Falling back to hardcoded gsnow connection details")
+                connection_details = None
+        
+        # Use hardcoded connection details as fallback
+        if connection_details is None:
+            connection_details = self.GSNOW_CONNECTION_DETAILS
+            print("✅ Using hardcoded gsnow connection details")
+        
+        session = None
+        current_host = None
+        catalog_name = None
+        
+        # Find the gsnow catalog connection
+        for platform_connection_info in connection_details:
+            # Look for ts_dwh_gsnow catalog
+            if platform_connection_info.get("catalogName") == "ts_dwh_gsnow":
+                connection_string_list = platform_connection_info["connectionString"].split(";")
+                catalog_name = platform_connection_info["catalogName"]
+                
+                starburst_connection_details = {}
+                for elem in connection_string_list:
+                    if "=" in elem:
+                        key, value = elem.split("=", 1)
+                        starburst_connection_details[key.strip()] = value.strip()
+                
+                host = starburst_connection_details.get("Host")
+                port = starburst_connection_details.get("Port", "443")
+                
+                if current_host != host:
+                    current_host = host
+                    db_parameters = {
+                        "host": current_host,
+                        "port": port,
+                        "http_scheme": "https",
+                        "verify": False,
+                        "auth": OAuth2Authentication(),
+                        "catalog": catalog_name
+                    }
+                    session = Session.builder.configs(db_parameters).create()
+                    break
+        
+        return session, catalog_name
+    
+    def connect(self):
+        """Establish database connections for both sources"""
+        print("\n" + "=" * 80)
+        print("🔌 ESTABLISHING DATABASE CONNECTIONS")
+        print("=" * 80)
+        
+        # Connect to Atlas
+        print("\n📡 Connecting to Atlas (IPM Service Management)...")
+        self.atlas_session, self.atlas_catalog_name = self.create_atlas_session()
+        if not self.atlas_session:
+            print("❌ Failed to create Atlas database session!")
+            return False
+        else:
+            print(f"✅ Connected to Atlas catalog: {self.atlas_catalog_name}")
+        
+        # Connect to gsnow
+        print("\n📡 Connecting to gsnow (ts_dwh_gsnow)...")
+        self.gsnow_session, self.gsnow_catalog_name = self.create_gsnow_session()
+        if not self.gsnow_session:
+            print("❌ Failed to create gsnow database session!")
+            return False
+        else:
+            print(f"✅ Connected to gsnow catalog: {self.gsnow_catalog_name}")
+        
+        return True
+
+    def add_crew_category(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Categorize records into detailed categories using comprehensive assignment_group mapping.
+        
+        This provides granular categorization with 10 detailed categories covering 369 assignment groups.
+        Output column: crew
+        """
+        if df is None or len(df) == 0:
+            return df
+        
+        if "assignment_group" not in df.columns:
+            df["crew"] = "Unknown"
+            return df
+        
+        # Category -> list of assignment groups
+        CATEGORY_TO_GROUPS = {
+            "Container Core": [
+                "DH-CP-Containers-SRE",
+                "DH-CP-Control-Plane-SRE",
+                "DH-PC-Control-Plane-SRE",
+                "DH-CP-Azure-HCI-L3",
+            ],
+
+            "Production Stability, Demand & Provisioning": [
+                "DH-PS-Decommission-Rollback",
+                "DH-PS-Decommission-Services-Global",
+                "DH-PS-Deployment-Services-CH",
+                "DH-PS-Deployment-Services-EMEA",
+                "DH-PS-Dispatching-Services-CH",
+                "DH-PS-Install-Services-CH",
+                "DH-PS-Manual-Task-Global",
+                "DH-PS-OPS-STFACTORY",
+                "DH-PS-Order-Review-CH",
+                "DH-PS-RESMGMT-CH",
+                "DH-PS-SRF-CORE-Global",
+                "DH-PS-SRF-ER-Deployment-Services-APAC",
+                "DH-PS-SRF-ER-Deployment-Services-Global",
+                "DH-PS-SRF-ER-Deployment-Services--GLOBAL",
+                "DH-PS-SRF-ER-Deployment-Services-UK",
+                "DH-PS-SRF-ER-Deployment-Services-US",
+                "DH-PS-SRF-ER-Install-Services-Global",
+                "DH-PS-SRF-Provisioning-Handover",
+                "DH-PS-Decommission-Assistance",
+            ],
+
+            "Compute Platform": [
+                "DH-CP-Containers",
+                "DH-CP-Containers-L2",
+                "DH-CP-Containers-Owner",
+                "DH-CP-Containers-SRE",
+                "DH-CT-Chassis-Support",
+                "DH-CT-Decommission-POD",
+                "DH-CP-Hardware-L3",
+                "DH-CP-Control-Plane-NON-PROD-SRE",
+                "DH-CP-Control-Plane-SRE",
+                "DH-PC-Control-Plane-SRE",
+                "DH-CP-Hardware-RISK",
+                "DH-CP-IaaS-Launch",
+                "DH-CP-LAB-L3",
+                "DH-CP-Virtual",
+                "DH-CP-Virtual-AMER",
+                "DH-CP-Virtual-APAC",
+                "DH-CP-Virtual-APAC-HP",
+                "DH-CP-Virtual-CH",
+                "DH-CP-Virtual-Restricted",
+                "DH-CP-Virtual-UK",
+                "DH-CP-Virtual-Vendor",
+                "DH-CP-Containers-ImageImportViaACR",
+                "DH-CP-IaaS-Hardware-HPE",
+                "DH-CP-Virtual-CH-HPE",
+            ],
+
+            "Change and Tranformation": [
+                "DH-CT-Decommission-ForcedClosure",
+                "DH-CT-Decommission-Rollback",
+                "DH-CT-Decommission-Services-Global",
+                "DH-CT-Decommission-Assistance",
+            ],
+
+            "Public Cloud Compute": [
+                "DH-CO-Containers-ImageImportViaACR",
+                "DH-CO-Containers",
+                "DH-CO-Containers-SRE",
+            ],
+
+            "Application Refactoring": [
+                "DH-AR-Application_Migration_Assurance-EMEA-L2",
+                "DH-AR-EoL-Global-Internal-L3",
+                "DH-AR-OnionDevSupp-L3",
+                "DH-AR-Tunadev-L3",
+                "DH-AR-DBA-PostgreSQL",
+                "DH-AR-LoB-TS-InfraApproval",
+                "DH-AR-SolutionDesign-AM",
+                "DH-AR-SolutionDesign-GF",
+                "DH-AR-SolutionDesign-HR",
+                "DH-AR-SolutionDesign-IB",
+                "DH-AR-SolutionDesign-TS",
+                "DH-AR-SolutionDesign-WMA",
+                "DH-AR-SolutionDesign-WMPC",
+                "DH-AR-SolutionDesign-All",
+            ],
+
+            "Database": [
+                "DH-DB-AzureDB",
+                "DH-DB-MSSQL",
+                "DH-DB-MSSQL-CH",
+                "DH-DB-MSSQL-CH-ER",
+                "DH-DB-MSSQL-Engineering",
+                "DH-DB-MSSQL-ER",
+                "DH-DB-Oracle",
+                "DH-DB-Oracle-CH",
+                "DH-DB-Oracle-CH-ER",
+                "DH-DB-Oracle-Engineering",
+                "DH-DB-Oracle-ER",
+                "DH-DB-Oracle-SERVER_L3",
+                "DH-DB-Oracle-SZ-APAC",
+                "TOC-IP-DB-ORACLE-SZ-APAC-L3",
+                "DH-DB-Engineering",
+                "DH-DB-Restricted",
+                "DH-DB-RM-Template-DB",
+                "DH-DB-WMAPAC",
+                "HS-DB-CSRE-TRAN",
+                "TOC-IP-DB-PATCHING-GLOB-L3",
+                "TOC-IP-DB-SECURITY-GLOB-L3",
+                "DH-DB-PostgreSQL",
+                "DH-DB-PostgreSQL-CH",
+                "DH-DB-PostgreSQL-CH-ER",
+                "DH-DB-PostgreSQL-ER",
+                "DH-DB-Sybase",
+                "DH-DB-Sybase-CH",
+                "DH-DB-Sybase-CH-ER",
+                "DH-DB-Sybase-Engineering",
+                "DH-DB-Sybase-ER",
+                "TOC-IP-DB-SYBSQL-SZ-APAC-L3",
+                "DH-DB-MGMT-REVIEW",
+                "DH-DB-Oracle-Cloud-Admins",
+                "DH-DB-Oracle-Placement-CH",
+                "DH-DB-Placement-Team",
+                "DH-DB-Security-Services-Global",
+                "TOC-IP-DAS-Oracle-CH",
+                "TOC-IP-DAS-Oracle-CH-ER",
+                "DH-DB-PLC-DB-OPS-Service",
+            ],
+
+            "Infrastructure Modernization": [
+                "DH-IM-Appsupport",
+                "DH-IM-Install-Services-CH",
+                "DH-IM-OPO-Delivery",
+                "DH-IM-OPS-STFACTORY",
+                "DH-IM-Reports",
+                "DH-IM-SPA-CH",
+                "DH-IM-SRF-ER-Install-Services-Global",
+                "DH-IM-SRF-MVS-Request-Mgmt",
+                "DH-IM-DBA-AzureSQL",
+                "DH-IM-OPS-MIDDLEWARE",
+                "DH-IM-OPS-MESSAGING",
+                "DH-IM-AAF-Cloud-Global-Internal-L2",
+                "DH-IM-AAF-Cloud-Global-Internal-L3",
+                "DH-IM-ISE-SAP-MIGRATION",
+                "DH-IM-MIGRATIONMANAGEMENT-ch",
+                "DH-IM-MigrationOrchestration-IMPT",
+                "DH-IM-Network-Application-Migration",
+                "DH-IM-RM-Impl-Approver-DBaaS-Migration-DB-Crea",
+                "DH-IM-VMwareExit_MF_Support",
+                "DH-IM-DBA-MSSQL",
+                "DH-IM-DBA-Oracle",
+                "DH-IM-DBA-Oracle-CH",
+                "DH-IM-DBA-PostgreSQL",
+                "DH-IM-OPO-UK-GATEKEEPER",
+                "DH-IM-DBA-Sybase",
+                "DH-IM-DCEXIT-UNIX",
+                "DH-IM-OPS-UNIX",
+                "DH-IM-DCEXIT-WINTEL",
+                "DH-IM-OPS-WINTEL",
+                "DH-IM-Deployment-Services-CH",
+                "DH-IM-Deployment-Services-EMEA",
+                "DH-IM-Dispatching-Services-CH",
+                "DH-IM-LOBL-ALL",
+                "DH-IM-Manual-Task-Global",
+                "DH-IM-MigrationAutomation-AA-Automation",
+                "DH-IM-MigrationAutomation-IPSoft-Automation",
+                "DH-IM-MigrationAutomation-isac-Automation",
+                "DH-IM-OPS-IPDNS",
+                "DH-IM-Order-Review-CH",
+                "DH-IM-ReleaseManagement",
+                "DH-IM-RM-Impl-Approver-DB-Dbaas-Mig",
+                "DH-IM-SRF-CORE-Global",
+                "DH-IM-SRF-ER-Deployment-Services-APAC",
+                "DH-IM-SRF-ER-Deployment-Services-Global",
+                "DH-IM-SRF-ER-Deployment-Services-UK",
+                "DH-IM-SRF-ER-Deployment-Services-US",
+                "DH-IM-SRF-ER-DM",
+                "DH-IM-SRF-Provisioning-Handover",
+                "DH-IM- Install-Services -CH",
+                "DH-IM- Manual-Task-Global",
+                "DH-IM-Deployment-MGR-CH",
+                "DH-IM-IP-SRF-Install-Services-AA-Automation",
+                "DH-IM-IP-SRF-RM-Swiss-WM-EMEA",
+                "DH-IM-MigrationOrchestration-AA-Automation",
+                "DH-IM-MigrationOrchestration-IPSoft-Automation",
+                "DH-IM-MigrationOrchestration-isac-Automation",
+                "DH-IM-SRF-DE-Install-Services-Global",
+                "DH-IM-SRF-ER-Deployment-Services--GLOBAL",
+            ],
+
+            "OSM": [
+                "DH-MW-AppHosting-AE_WEB_CONSULTING_L3",
+                "DH-MW-AppHosting-AS-GLOBAL-INFRA",
+                "DH-MW-AppHosting-Azure-Eng",
+                "DH-MW-AppHosting-DAS-SCHEDULING",
+                "DH-MW-AppHosting-Documentum",
+                "DH-MW-AppHosting-Documentum-SRE",
+                "DH-MW-AppHosting-Eng",
+                "DH-MW-AppHosting-Global-MDAS-ER",
+                "DH-MW-AppHosting-JobScheduling-ENG",
+                "DH-MW-AppHosting-JobScheduling-SRE",
+                "DH-MW-AppHosting-WEB_CHANNEL_SLS",
+                "DH-MW-AppHosting-Web-AMER-SRE",
+                "DH-MW-AppHosting-Web-APAC-SRE",
+                "DH-MW-AppHosting-Web-CH-Approver",
+                "DH-MW-AppHosting-Web-CH-SRE",
+                "DH-MW-AppHosting-Web-EMEA-SRE",
+                "DH-MW-AppHosting-Web-IIS",
+                "DH-MW-AppHosting-Web-SRE",
+                "DH-MW-AppHosting-Web-SSZ",
+                "DH-MW-AppHosting-Web-WMAPAC-SRE",
+                "DH-MW-AppHosting-Web-WMSB",
+                "DH-MW-ApplicationHosting-PCF-L3",
+                "TS-HS-MW-Azure-AppHosting-Eng",
+                "TOC-IP-MW-Automation",
+                "DH-MW-FileTransfer-Axway",
+                "DH-MW-FileTransfer-Axway-CH",
+                "DH-MW-FileTransfer-Axway-SG",
+                "DH-MW-FileTransfer-Axway-Trans",
+                "HS-MW-FT-Axway",
+                "HS-MW-FT-Axway-CH",
+                "HS-MW-FT-Axway-SG",
+                "HS-MW-FTTrans",
+                "TOC-IP-MW-FileTransfer-Config",
+                "DH-MW-FileTransfer-MFT-CONFIG",
+                "DH-MW-FileTransfer-MFT-PROD_FLS",
+                "DH-MW-FileTransfer-MFT-SLS",
+                "DH-MW-FileTransfer-MFT-TEST_FLS",
+                "DH-MW-FileTransfer-MFT-TLS",
+                "DH-MW-Events",
+                "DH-MW-Events-Config",
+                "DH-MW-Events-Eng",
+                "DH-MW-Events-Eng-MQ",
+                "DH-MW-Events-Eng-ORCANG",
+                "DH-MW-Events-Eng-RV",
+                "DH-MW-Events-Netcool",
+                "DH-MW-Events-Softw-Distribution-Tools-Eng-L3",
+                "DH-MW-AppHosting-Web-WMAMER-SRE",
+                "DH-OSM-Unix-Risk",
+                "TOC-IP-MW-RateUs",
+                "DH-OS-Exadata-ODA",
+                "DH-OS-Linux-AMER",
+                "DH-OS-Linux-APAC",
+                "DH-OS-Linux-Azure-Native",
+                "DH-OS-Linux-BSC",
+                "DH-OS-Linux-CH",
+                "DH-OS-Linux-CH-ER",
+                "DH-OS-Linux-EMEA",
+                "DH-OS-Linux-Eng",
+                "DH-OS-Linux-Exadata-ODA",
+                "DH-OS-Linux-Exadata-ODA-CH",
+                "DH-OS-Linux-Global",
+                "DH-OS-Linux-OSautoconfig",
+                "TOC-IP-MW-Messaging",
+                "TOC-IP-MW-Messaging-Config",
+                "TOC-IP-MW-Messaging-ER",
+                "TOC-IP-MW-Messaging-Netcool",
+                "TOC-IP-MW-Messaging-Scheduling",
+                "TOC-IP-MW-Messaging-SR",
+                "TOC-IP-MW-Messaging-Tuxedo",
+                "TOC-IP-MW-MSTR",
+                "TOC-IP-MW-MSTR-Mon",
+                "DH-OS-EXAD-DbaaS-VM1",
+                "DH-OS-FOM",
+                "DH-OS-Timekeeper",
+                "TOC-BAS-Middleware-WMA",
+                "TOC-ETS-MW-Web-SD-CH-ER",
+                "TOC-IP-Middleware-DDS",
+                "TOC-IP-MW-ADT-ER",
+                "TOC-IP-MW-Agile-BI",
+                "TOC-IP-MW-Agile-BI-ER",
+                "TOC-IP-MW-Agile-BI-WMAPAC",
+                "TOC-IP-MW-AIOPS",
+                "TOC-IP-MW-Autosys-ER",
+                "TOC-IP-MW-BI-Infra",
+                "TOC-IP-MW-BO4",
+                "TOC-IP-MW-BO4-ER",
+                "TOC-IP-MW-BO-ER",
+                "TOC-IP-MW-Business-Objects",
+                "TOC-IP-MW-Documentum",
+                "TOC-IP-MW-Documentum-ER",
+                "TOC-IP-MW-Global-ER",
+                "TOC-IP-MW-Global-MDAS-ER",
+                "TOC-IP-MW-TempAuto",
+                "DH-OS-Linux-Risk",
+                "DH-OS-EcoSys3-Risk",
+                "TOC-IP-MW-FileTransfer-TW",
+                "DH-MW-FileTransfer-Tumbleweed",
+                "HS-MW-FT-Tumbleweed",
+                "TOC-IP-MW-Tumbleweed-ER",
+                "DH-OS-EcoSys3-Unix-Risk",
+                "DH-OS-Solaris-Eng",
+                "DH-OS-Solaris-VM1",
+                "TOC-IP-MW-Web-AMER",
+                "TOC-IP-MW-Web-AMER-Approver",
+                "TOC-IP-MW-Web-APAC",
+                "TOC-IP-MW-Web-APAC-Approver",
+                "TOC-IP-MW-Web-CH-Approver",
+                "TOC-IP-MW-Web-CH-ER",
+                "TOC-IP-MW-Web-EMEA",
+                "TOC-IP-MW-Web-EMEA-Approver",
+                "TOC-IP-MW-Web-ER",
+                "TOC-IP-MW-Web-IIS",
+                "TOC-IP-MW-Web-SSZ",
+                "TOC-IP-MW-Web-WMAMER",
+                "TOC-IP-MW-Web-WMAPAC",
+                "TOC-IP-MW-Web-WMEMEA",
+                "TOC-IP-MW-Web-WMSB",
+                "TOC-IP-MW-Web-ZOS",
+                "DHC-OS-Windows-SRE-AMER",
+                "DH-OS-Windows-APAC",
+                "DH-OS-Windows-CH",
+                "DH-OS-Windows-Eng",
+                "DH-OS-Windows-Global",
+                "DH-OS-Windows-Risk",
+                "DH-OS-Windows-SRE-AMER",
+                "DH-MW-AppHosting-JobScheduling-RM",
+                "DH-MW-AppHosting-Patching",
+                "DH-MW-AppHosting-Web-WMEMEA",
+                "DH-MW-Events-SR",
+                "DH-MW-Events-SR-Approver",
+                "DH-OS-Exadata-ODA-CH",
+                "DH-OS-Linux-Automation-SNI",
+                "DH-OS-Linux-Powerbroker-Approvers",
+                "DH-OS-Windows-Samurai-Automation",
+            ],
+
+            "Storage": [
+                "DH-ST-Managed-Storage-Control-Automation",
+                "DH-ST-Cloud-Reliability",
+                "DH-ST-Cloud-Storage-Services",
+                "DH-ST-CyberRecoveryVault-CH",
+                "DH-ST-CyberRecoveryVault-Eng",
+                "DH-ST-CyberRecoveryVault-Global",
+                "DH-ST-CyberRecoveryVault-HK",
+                "DH-ST-CyberRecoveryVault-SG",
+                "DH-ST-CyberRecoveryVault-UK",
+                "DH-ST-CyberRecoveryVault-US",
+                "DH-ST-Networker-Ops",
+                "DH-ST-DDbackupControl-GLOB",
+                "TOC-IP-Storage-DDbackupControl-GLOB",
+                "TOC-IP-Storage-ReferenceAdmin-GLOB",
+                "DH-ST-GroupShareMigrations-L3",
+                "DH-ST-NAS-Eng-L3",
+                "DH-ST-OnlineStorage-NAS-AMER-L2",
+                "DH-ST-OnlineStorage-NAS-AMER-L3",
+                "DH-ST-OnlineStorage-NAS-APAC-L2",
+                "DH-ST-OnlineStorage-NAS-APAC-L3",
+                "DH-ST-OnlineStorage-NAS-CH-L2",
+                "DH-ST-OnlineStorage-NAS-CH-L2-RED",
+                "DH-ST-OnlineStorage-NAS-CH-L3",
+                "DH-ST-OnlineStorage-NAS-CH-L3-RED",
+                "DH-ST-OnlineStorage-NAS-EMEA-L2",
+                "DH-ST-OnlineStorage-NAS-EMEA-L3",
+                "DH-ST-OfflineStorage-APAC-Red",
+                "DH-ST-OfflineStorage-CH-Red",
+                "DH-ST-OfflineStorage-L2",
+                "DH-ST-OfflineStorage-L3",
+                "DH-ST-ORaaS-BAT",
+                "DH-ST-ORaaS-Eng",
+                "DH-ST-AMS-Eng",
+                "DH-ST-GDDC",
+                "DH-ST-HCI-US",
+                "DH-ST-NGA-CH",
+                "DH-ST-NGA-GDDC",
+                "DH-ST-NGA-L3",
+                "DH-ST-OAS",
+                "TS-Storage-MAS-Eng_L3",
+                "DH-ST-OnlineStorage-SAN-AMER-L2",
+                "DH-ST-OnlineStorage-SAN-AMER-L3",
+                "DH-ST-OnlineStorage-SAN-APAC-L2",
+                "DH-ST-OnlineStorage-SAN-APAC-L3",
+                "DH-ST-OnlineStorage-SAN-CH-L2",
+                "DH-ST-OnlineStorage-SAN-CH-L3",
+                "DH-ST-OnlineStorage-SAN-EMEA-L2",
+                "DH-ST-OnlineStorage-SAN-EMEA-L3",
+                "DH-ST-Capacity-GLOB",
+                "DH-ST-Request-Reviewers-SAN",
+                "DH-ST-Request-Reviewers-NAS",
+                "DH-ST-VM-Ops-Fabric",
+            ],
+        }
+        
+        # Create reverse mapping: assignment_group -> category
+        group_to_category = {}
+        for category, groups in CATEGORY_TO_GROUPS.items():
+            for group in groups:
+                group_to_category[group] = category
+        
+        # Map assignment groups to categories
+        df["crew"] = df["assignment_group"].map(group_to_category).fillna("Unknown")
+        
+        return df
+
+    def add_automation_status(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Derive automation status from resolved_by_user_name.
+
+        Rule (case-insensitive):
+        - If resolved_by_user_name is one of:
+          1) bigpanda
+          2) IPSoft TechUser
+          3) Amelia AIOps(PRD)
+          -> Automated
+        - Else -> Manual
+
+        Output column: automation_status
+        """
+        if df is None or len(df) == 0:
+            return df
+
+        if "resolved_by_user_name" not in df.columns:
+            df["automation_status"] = "Manual"
+            return df
+
+        automated_resolvers = {
+            "bigpanda",
+            "ipsoft techuser",
+            "amelia aiops(prd)",
+        }
+
+        resolver = (
+            df["resolved_by_user_name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+
+        df["automation_status"] = np.where(
+            resolver.isin(automated_resolvers),
+            "Automated",
+            "Manual",
+        )
+        return df
+    
+    def add_detailed_category(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Categorize records into detailed categories using comprehensive assignment_group mapping.
+        
+        This provides more granular categorization than add_crew_category().
+        Output column: detailed_category
+        """
+        if df is None or len(df) == 0:
+            return df
+        
+        if "assignment_group" not in df.columns:
+            df["detailed_category"] = "Unknown"
+            return df
+        
+        # Category -> list of assignment groups
+        CATEGORY_TO_GROUPS = {
+            "Container Core": [
+                "DH-CP-Containers-SRE",
+                "DH-CP-Control-Plane-SRE",
+                "DH-PC-Control-Plane-SRE",
+                "DH-CP-Azure-HCI-L3",
+            ],
+
+            "Production Stability, Demand & Provisioning": [
+                "DH-PS-Decommission-Rollback",
+                "DH-PS-Decommission-Services-Global",
+                "DH-PS-Deployment-Services-CH",
+                "DH-PS-Deployment-Services-EMEA",
+                "DH-PS-Dispatching-Services-CH",
+                "DH-PS-Install-Services-CH",
+                "DH-PS-Manual-Task-Global",
+                "DH-PS-OPS-STFACTORY",
+                "DH-PS-Order-Review-CH",
+                "DH-PS-RESMGMT-CH",
+                "DH-PS-SRF-CORE-Global",
+                "DH-PS-SRF-ER-Deployment-Services-APAC",
+                "DH-PS-SRF-ER-Deployment-Services-Global",
+                "DH-PS-SRF-ER-Deployment-Services--GLOBAL",
+                "DH-PS-SRF-ER-Deployment-Services-UK",
+                "DH-PS-SRF-ER-Deployment-Services-US",
+                "DH-PS-SRF-ER-Install-Services-Global",
+                "DH-PS-SRF-Provisioning-Handover",
+                "DH-PS-Decommission-Assistance",
+            ],
+
+            "Compute Platform": [
+                "DH-CP-Containers",
+                "DH-CP-Containers-L2",
+                "DH-CP-Containers-Owner",
+                "DH-CP-Containers-SRE",
+                "DH-CT-Chassis-Support",
+                "DH-CT-Decommission-POD",
+                "DH-CP-Hardware-L3",
+                "DH-CP-Control-Plane-NON-PROD-SRE",
+                "DH-CP-Control-Plane-SRE",
+                "DH-PC-Control-Plane-SRE",
+                "DH-CP-Hardware-RISK",
+                "DH-CP-IaaS-Launch",
+                "DH-CP-LAB-L3",
+                "DH-CP-Virtual",
+                "DH-CP-Virtual-AMER",
+                "DH-CP-Virtual-APAC",
+                "DH-CP-Virtual-APAC-HP",
+                "DH-CP-Virtual-CH",
+                "DH-CP-Virtual-Restricted",
+                "DH-CP-Virtual-UK",
+                "DH-CP-Virtual-Vendor",
+                "DH-CP-Containers-ImageImportViaACR",
+                "DH-CP-IaaS-Hardware-HPE",
+                "DH-CP-Virtual-CH-HPE",
+            ],
+
+            "Change and Tranformation": [
+                "DH-CT-Decommission-ForcedClosure",
+                "DH-CT-Decommission-Rollback",
+                "DH-CT-Decommission-Services-Global",
+                "DH-CT-Decommission-Assistance",
+            ],
+
+            "Public Cloud Compute": [
+                "DH-CO-Containers-ImageImportViaACR",
+                "DH-CO-Containers",
+                "DH-CO-Containers-SRE",
+            ],
+
+            "Application Refactoring": [
+                "DH-AR-Application_Migration_Assurance-EMEA-L2",
+                "DH-AR-EoL-Global-Internal-L3",
+                "DH-AR-OnionDevSupp-L3",
+                "DH-AR-Tunadev-L3",
+                "DH-AR-DBA-PostgreSQL",
+                "DH-AR-LoB-TS-InfraApproval",
+                "DH-AR-SolutionDesign-AM",
+                "DH-AR-SolutionDesign-GF",
+                "DH-AR-SolutionDesign-HR",
+                "DH-AR-SolutionDesign-IB",
+                "DH-AR-SolutionDesign-TS",
+                "DH-AR-SolutionDesign-WMA",
+                "DH-AR-SolutionDesign-WMPC",
+                "DH-AR-SolutionDesign-All",
+            ],
+
+            "Database": [
+                "DH-DB-AzureDB",
+                "DH-DB-MSSQL",
+                "DH-DB-MSSQL-CH",
+                "DH-DB-MSSQL-CH-ER",
+                "DH-DB-MSSQL-Engineering",
+                "DH-DB-MSSQL-ER",
+                "DH-DB-Oracle",
+                "DH-DB-Oracle-CH",
+                "DH-DB-Oracle-CH-ER",
+                "DH-DB-Oracle-Engineering",
+                "DH-DB-Oracle-ER",
+                "DH-DB-Oracle-SERVER_L3",
+                "DH-DB-Oracle-SZ-APAC",
+                "TOC-IP-DB-ORACLE-SZ-APAC-L3",
+                "DH-DB-Engineering",
+                "DH-DB-Restricted",
+                "DH-DB-RM-Template-DB",
+                "DH-DB-WMAPAC",
+                "HS-DB-CSRE-TRAN",
+                "TOC-IP-DB-PATCHING-GLOB-L3",
+                "TOC-IP-DB-SECURITY-GLOB-L3",
+                "DH-DB-PostgreSQL",
+                "DH-DB-PostgreSQL-CH",
+                "DH-DB-PostgreSQL-CH-ER",
+                "DH-DB-PostgreSQL-ER",
+                "DH-DB-Sybase",
+                "DH-DB-Sybase-CH",
+                "DH-DB-Sybase-CH-ER",
+                "DH-DB-Sybase-Engineering",
+                "DH-DB-Sybase-ER",
+                "TOC-IP-DB-SYBSQL-SZ-APAC-L3",
+                "DH-DB-MGMT-REVIEW",
+                "DH-DB-Oracle-Cloud-Admins",
+                "DH-DB-Oracle-Placement-CH",
+                "DH-DB-Placement-Team",
+                "DH-DB-Security-Services-Global",
+                "TOC-IP-DAS-Oracle-CH",
+                "TOC-IP-DAS-Oracle-CH-ER",
+                "DH-DB-PLC-DB-OPS-Service",
+            ],
+
+            "Infrastructure Modernization": [
+                "DH-IM-Appsupport",
+                "DH-IM-Install-Services-CH",
+                "DH-IM-OPO-Delivery",
+                "DH-IM-OPS-STFACTORY",
+                "DH-IM-Reports",
+                "DH-IM-SPA-CH",
+                "DH-IM-SRF-ER-Install-Services-Global",
+                "DH-IM-SRF-MVS-Request-Mgmt",
+                "DH-IM-DBA-AzureSQL",
+                "DH-IM-OPS-MIDDLEWARE",
+                "DH-IM-OPS-MESSAGING",
+                "DH-IM-AAF-Cloud-Global-Internal-L2",
+                "DH-IM-AAF-Cloud-Global-Internal-L3",
+                "DH-IM-ISE-SAP-MIGRATION",
+                "DH-IM-MIGRATIONMANAGEMENT-ch",
+                "DH-IM-MigrationOrchestration-IMPT",
+                "DH-IM-Network-Application-Migration",
+                "DH-IM-RM-Impl-Approver-DBaaS-Migration-DB-Crea",
+                "DH-IM-VMwareExit_MF_Support",
+                "DH-IM-DBA-MSSQL",
+                "DH-IM-DBA-Oracle",
+                "DH-IM-DBA-Oracle-CH",
+                "DH-IM-DBA-PostgreSQL",
+                "DH-IM-OPO-UK-GATEKEEPER",
+                "DH-IM-DBA-Sybase",
+                "DH-IM-DCEXIT-UNIX",
+                "DH-IM-OPS-UNIX",
+                "DH-IM-DCEXIT-WINTEL",
+                "DH-IM-OPS-WINTEL",
+                "DH-IM-Deployment-Services-CH",
+                "DH-IM-Deployment-Services-EMEA",
+                "DH-IM-Dispatching-Services-CH",
+                "DH-IM-LOBL-ALL",
+                "DH-IM-Manual-Task-Global",
+                "DH-IM-MigrationAutomation-AA-Automation",
+                "DH-IM-MigrationAutomation-IPSoft-Automation",
+                "DH-IM-MigrationAutomation-isac-Automation",
+                "DH-IM-OPS-IPDNS",
+                "DH-IM-Order-Review-CH",
+                "DH-IM-ReleaseManagement",
+                "DH-IM-RM-Impl-Approver-DB-Dbaas-Mig",
+                "DH-IM-SRF-CORE-Global",
+                "DH-IM-SRF-ER-Deployment-Services-APAC",
+                "DH-IM-SRF-ER-Deployment-Services-Global",
+                "DH-IM-SRF-ER-Deployment-Services-UK",
+                "DH-IM-SRF-ER-Deployment-Services-US",
+                "DH-IM-SRF-ER-DM",
+                "DH-IM-SRF-Provisioning-Handover",
+                "DH-IM- Install-Services -CH",
+                "DH-IM- Manual-Task-Global",
+                "DH-IM-Deployment-MGR-CH",
+                "DH-IM-IP-SRF-Install-Services-AA-Automation",
+                "DH-IM-IP-SRF-RM-Swiss-WM-EMEA",
+                "DH-IM-MigrationOrchestration-AA-Automation",
+                "DH-IM-MigrationOrchestration-IPSoft-Automation",
+                "DH-IM-MigrationOrchestration-isac-Automation",
+                "DH-IM-SRF-DE-Install-Services-Global",
+                "DH-IM-SRF-ER-Deployment-Services--GLOBAL",
+            ],
+
+            "OSM": [
+                "DH-MW-AppHosting-AE_WEB_CONSULTING_L3",
+                "DH-MW-AppHosting-AS-GLOBAL-INFRA",
+                "DH-MW-AppHosting-Azure-Eng",
+                "DH-MW-AppHosting-DAS-SCHEDULING",
+                "DH-MW-AppHosting-Documentum",
+                "DH-MW-AppHosting-Documentum-SRE",
+                "DH-MW-AppHosting-Eng",
+                "DH-MW-AppHosting-Global-MDAS-ER",
+                "DH-MW-AppHosting-JobScheduling-ENG",
+                "DH-MW-AppHosting-JobScheduling-SRE",
+                "DH-MW-AppHosting-WEB_CHANNEL_SLS",
+                "DH-MW-AppHosting-Web-AMER-SRE",
+                "DH-MW-AppHosting-Web-APAC-SRE",
+                "DH-MW-AppHosting-Web-CH-Approver",
+                "DH-MW-AppHosting-Web-CH-SRE",
+                "DH-MW-AppHosting-Web-EMEA-SRE",
+                "DH-MW-AppHosting-Web-IIS",
+                "DH-MW-AppHosting-Web-SRE",
+                "DH-MW-AppHosting-Web-SSZ",
+                "DH-MW-AppHosting-Web-WMAPAC-SRE",
+                "DH-MW-AppHosting-Web-WMSB",
+                "DH-MW-ApplicationHosting-PCF-L3",
+                "TS-HS-MW-Azure-AppHosting-Eng",
+                "TOC-IP-MW-Automation",
+                "DH-MW-FileTransfer-Axway",
+                "DH-MW-FileTransfer-Axway-CH",
+                "DH-MW-FileTransfer-Axway-SG",
+                "DH-MW-FileTransfer-Axway-Trans",
+                "HS-MW-FT-Axway",
+                "HS-MW-FT-Axway-CH",
+                "HS-MW-FT-Axway-SG",
+                "HS-MW-FTTrans",
+                "TOC-IP-MW-FileTransfer-Config",
+                "DH-MW-FileTransfer-MFT-CONFIG",
+                "DH-MW-FileTransfer-MFT-PROD_FLS",
+                "DH-MW-FileTransfer-MFT-SLS",
+                "DH-MW-FileTransfer-MFT-TEST_FLS",
+                "DH-MW-FileTransfer-MFT-TLS",
+                "DH-MW-Events",
+                "DH-MW-Events-Config",
+                "DH-MW-Events-Eng",
+                "DH-MW-Events-Eng-MQ",
+                "DH-MW-Events-Eng-ORCANG",
+                "DH-MW-Events-Eng-RV",
+                "DH-MW-Events-Netcool",
+                "DH-MW-Events-Softw-Distribution-Tools-Eng-L3",
+                "DH-MW-AppHosting-Web-WMAMER-SRE",
+                "DH-OSM-Unix-Risk",
+                "TOC-IP-MW-RateUs",
+                "DH-OS-Exadata-ODA",
+                "DH-OS-Linux-AMER",
+                "DH-OS-Linux-APAC",
+                "DH-OS-Linux-Azure-Native",
+                "DH-OS-Linux-BSC",
+                "DH-OS-Linux-CH",
+                "DH-OS-Linux-CH-ER",
+                "DH-OS-Linux-EMEA",
+                "DH-OS-Linux-Eng",
+                "DH-OS-Linux-Exadata-ODA",
+                "DH-OS-Linux-Exadata-ODA-CH",
+                "DH-OS-Linux-Global",
+                "DH-OS-Linux-OSautoconfig",
+                "TOC-IP-MW-Messaging",
+                "TOC-IP-MW-Messaging-Config",
+                "TOC-IP-MW-Messaging-ER",
+                "TOC-IP-MW-Messaging-Netcool",
+                "TOC-IP-MW-Messaging-Scheduling",
+                "TOC-IP-MW-Messaging-SR",
+                "TOC-IP-MW-Messaging-Tuxedo",
+                "TOC-IP-MW-MSTR",
+                "TOC-IP-MW-MSTR-Mon",
+                "DH-OS-EXAD-DbaaS-VM1",
+                "DH-OS-FOM",
+                "DH-OS-Timekeeper",
+                "TOC-BAS-Middleware-WMA",
+                "TOC-ETS-MW-Web-SD-CH-ER",
+                "TOC-IP-Middleware-DDS",
+                "TOC-IP-MW-ADT-ER",
+                "TOC-IP-MW-Agile-BI",
+                "TOC-IP-MW-Agile-BI-ER",
+                "TOC-IP-MW-Agile-BI-WMAPAC",
+                "TOC-IP-MW-AIOPS",
+                "TOC-IP-MW-Autosys-ER",
+                "TOC-IP-MW-BI-Infra",
+                "TOC-IP-MW-BO4",
+                "TOC-IP-MW-BO4-ER",
+                "TOC-IP-MW-BO-ER",
+                "TOC-IP-MW-Business-Objects",
+                "TOC-IP-MW-Documentum",
+                "TOC-IP-MW-Documentum-ER",
+                "TOC-IP-MW-Global-ER",
+                "TOC-IP-MW-Global-MDAS-ER",
+                "TOC-IP-MW-TempAuto",
+                "DH-OS-Linux-Risk",
+                "DH-OS-EcoSys3-Risk",
+                "TOC-IP-MW-FileTransfer-TW",
+                "DH-MW-FileTransfer-Tumbleweed",
+                "HS-MW-FT-Tumbleweed",
+                "TOC-IP-MW-Tumbleweed-ER",
+                "DH-OS-EcoSys3-Unix-Risk",
+                "DH-OS-Solaris-Eng",
+                "DH-OS-Solaris-VM1",
+                "TOC-IP-MW-Web-AMER",
+                "TOC-IP-MW-Web-AMER-Approver",
+                "TOC-IP-MW-Web-APAC",
+                "TOC-IP-MW-Web-APAC-Approver",
+                "TOC-IP-MW-Web-CH-Approver",
+                "TOC-IP-MW-Web-CH-ER",
+                "TOC-IP-MW-Web-EMEA",
+                "TOC-IP-MW-Web-EMEA-Approver",
+                "TOC-IP-MW-Web-ER",
+                "TOC-IP-MW-Web-IIS",
+                "TOC-IP-MW-Web-SSZ",
+                "TOC-IP-MW-Web-WMAMER",
+                "TOC-IP-MW-Web-WMAPAC",
+                "TOC-IP-MW-Web-WMEMEA",
+                "TOC-IP-MW-Web-WMSB",
+                "TOC-IP-MW-Web-ZOS",
+                "DHC-OS-Windows-SRE-AMER",
+                "DH-OS-Windows-APAC",
+                "DH-OS-Windows-CH",
+                "DH-OS-Windows-Eng",
+                "DH-OS-Windows-Global",
+                "DH-OS-Windows-Risk",
+                "DH-OS-Windows-SRE-AMER",
+                "DH-MW-AppHosting-JobScheduling-RM",
+                "DH-MW-AppHosting-Patching",
+                "DH-MW-AppHosting-Web-WMEMEA",
+                "DH-MW-Events-SR",
+                "DH-MW-Events-SR-Approver",
+                "DH-OS-Exadata-ODA-CH",
+                "DH-OS-Linux-Automation-SNI",
+                "DH-OS-Linux-Powerbroker-Approvers",
+                "DH-OS-Windows-Samurai-Automation",
+            ],
+
+            "Storage": [
+                "DH-ST-Managed-Storage-Control-Automation",
+                "DH-ST-Cloud-Reliability",
+                "DH-ST-Cloud-Storage-Services",
+                "DH-ST-CyberRecoveryVault-CH",
+                "DH-ST-CyberRecoveryVault-Eng",
+                "DH-ST-CyberRecoveryVault-Global",
+                "DH-ST-CyberRecoveryVault-HK",
+                "DH-ST-CyberRecoveryVault-SG",
+                "DH-ST-CyberRecoveryVault-UK",
+                "DH-ST-CyberRecoveryVault-US",
+                "DH-ST-Networker-Ops",
+                "DH-ST-DDbackupControl-GLOB",
+                "TOC-IP-Storage-DDbackupControl-GLOB",
+                "TOC-IP-Storage-ReferenceAdmin-GLOB",
+                "DH-ST-GroupShareMigrations-L3",
+                "DH-ST-NAS-Eng-L3",
+                "DH-ST-OnlineStorage-NAS-AMER-L2",
+                "DH-ST-OnlineStorage-NAS-AMER-L3",
+                "DH-ST-OnlineStorage-NAS-APAC-L2",
+                "DH-ST-OnlineStorage-NAS-APAC-L3",
+                "DH-ST-OnlineStorage-NAS-CH-L2",
+                "DH-ST-OnlineStorage-NAS-CH-L2-RED",
+                "DH-ST-OnlineStorage-NAS-CH-L3",
+                "DH-ST-OnlineStorage-NAS-CH-L3-RED",
+                "DH-ST-OnlineStorage-NAS-EMEA-L2",
+                "DH-ST-OnlineStorage-NAS-EMEA-L3",
+                "DH-ST-OfflineStorage-APAC-Red",
+                "DH-ST-OfflineStorage-CH-Red",
+                "DH-ST-OfflineStorage-L2",
+                "DH-ST-OfflineStorage-L3",
+                "DH-ST-ORaaS-BAT",
+                "DH-ST-ORaaS-Eng",
+                "DH-ST-AMS-Eng",
+                "DH-ST-GDDC",
+                "DH-ST-HCI-US",
+                "DH-ST-NGA-CH",
+                "DH-ST-NGA-GDDC",
+                "DH-ST-NGA-L3",
+                "DH-ST-OAS",
+                "TS-Storage-MAS-Eng_L3",
+                "DH-ST-OnlineStorage-SAN-AMER-L2",
+                "DH-ST-OnlineStorage-SAN-AMER-L3",
+                "DH-ST-OnlineStorage-SAN-APAC-L2",
+                "DH-ST-OnlineStorage-SAN-APAC-L3",
+                "DH-ST-OnlineStorage-SAN-CH-L2",
+                "DH-ST-OnlineStorage-SAN-CH-L3",
+                "DH-ST-OnlineStorage-SAN-EMEA-L2",
+                "DH-ST-OnlineStorage-SAN-EMEA-L3",
+                "DH-ST-Capacity-GLOB",
+                "DH-ST-Request-Reviewers-SAN",
+                "DH-ST-Request-Reviewers-NAS",
+                "DH-ST-VM-Ops-Fabric",
+            ],
+        }
+        
+        # Create reverse mapping: assignment_group -> category
+        group_to_category = {}
+        for category, groups in CATEGORY_TO_GROUPS.items():
+            for group in groups:
+                group_to_category[group] = category
+        
+        # Map assignment groups to categories
+        df["detailed_category"] = df["assignment_group"].map(group_to_category).fillna("Unknown")
+        
+        return df
+    
+    def get_column_mapping(self):
+        """
+        Define column mapping between Atlas and gsnow sources.
+        Maps gsnow column names to Atlas column names (standard).
+        """
+        mapping = {
+            # Core incident identifiers
+            "inc_number": "incident_number",
+            "assigned_grp": "assignment_group",
+            
+            # Dates and timestamps
+            "created_on": "sys_created_on",
+            "opened_at": "opened_at",
+            "resolved_at": "resolved_at",
+            "closed_at": "closed_at",
+            "updated_on": "sys_updated_on",
+            
+            # Priority and classification
+            "inc_priority": "priority",
+            "severity": "severity",
+            "urgency": "urgency",
+            "business_impact": "business_impact",
+            "operational_impact": "u_operational_impact",
+            
+            # Categorization
+            "category": "category",
+            # gsnow column uses a hyphenated name in this dataset
+            "sub-category": "subcategory",
+            "type": "contact_type",
+            "contact_type": "contact_type",
+            
+            # Descriptions
+            "short_description": "short_description",
+            "description": "description",
+            "solution": "close_notes",  # Approximate mapping
+            
+            # Assignment and ownership
+            "service_owner_grp": "business_service",
+            "service_impacted": "cmdb_ci",
+            "service_impacted_id": "cmdb_ci_sys_id",
+            
+            # Creator/caller information
+            "creator_gpn": "opened_by_gpn",
+            "creator_bus_name": "opened_by_user_name",
+            
+            # Location and business context
+            "impacted_country": "u_impacted_country",
+            "business_cluster": "u_business_cluster",
+            "business_cluster_owner": "u_business_cluster_owner",
+            "business_cluster_owner_gpn": "u_business_cluster_owner_gpn",
+            
+            # Service information
+            "service_environment": "u_service_environment",
+            "service_division": "service_division",
+            "service_division_id": "service_division_id",
+            "business_stream": "u_business_stream",
+            "business_stream_prg_mgr": "u_business_stream_prg_mgr",
+            "business_stream_prg_mgr_gpn": "u_business_stream_prg_mgr_gpn",
+            "business_stream_id": "u_business_stream_id",
+            
+            # IT sector
+            "it_sector": "u_it_sector",
+            "it_sector_cio": "u_it_sector_cio",
+            
+            # Solution domain
+            "solution_domain": "u_solution_domain",
+            "solution_domain_id": "u_solution_domain_id",
+            "solution_domain_mgr": "u_solution_domain_mgr",
+            "solution_domain_mgr_gpn": "u_solution_domain_mgr_gpn",
+            
+            # SWCI/SWC
+            "swci": "swci_id",
+            "swci_id": "swci_id",
+            "swc": "swc",
+            "swc_id": "swc_id",
+            
+            # Additional fields
+            "state": "state",
+            "business_impact_severity": "business_impact",
+            "resolution_sla_name": "made_sla",
+            "response_ola_name": "made_sla",
+            "1st_assigned_grp": "assignment_group",
+            "updated_by_gpn": "sys_updated_by",
+            "resolved_by_name": "resolved_by_user_name",
+            "attached_kb_number": "knowledge",
+            "related_item": "parent",
+            "source_name": "origin_table",
+            "service_type": "type",
+            "technology_bcm_tier": "u_technology_bcm_tier",
+            "bcm_criticality_tier_rating": "u_bcm_criticality_tier_rating",
+        }
+        
+        return mapping
+    
+    def fetch_atlas_data(self):
+        """Fetch data from Atlas (IPM Incident Flat) for DH assignment groups within the configured date window."""
+        print("\n" + "=" * 80)
+        print("📥 FETCHING ATLAS DATA (IPM Incident Flat)")
+        print("=" * 80)
+        print(f"📅 Period: {self.start_date} to {self.end_date} (end exclusive)")
+        
+        if not self.atlas_session:
+            print("❌ No Atlas session available")
+            return None
+        
+        catalog = "ipm_service_management"
+        schema = "ipm_service_management_schema"
+        table = "ipm_incident_flat"
+        fqtn = f"{catalog}.{schema}.{table}"
+        date_col = "opened_at"
+        
+        # Define relevant columns for Atlas
+        atlas_columns = [
+            "incident_number",
+            "opened_at",
+            "opened_by_user_name",
+            "opened_by_gpn",
+            "closed_at",
+            "resolved_at",
+            "assignment_group",
+            "assignment_group_id",
+            "assigned_to_gpn",
+            "assigned_to_user_name",
+            "caller_gpn",
+            "caller_user_name",
+            "state",
+            "priority",
+            "severity",
+            "category",
+            "subcategory",
+            "short_description",
+            "description",
+            "impact",
+            "urgency",
+            "business_impact",
+            "business_service",
+            "cmdb_ci",
+            "cmdb_ci_sys_id",
+            "location",
+            "company",
+            "active",
+            "incident_state",
+            "reassignment_count",
+            "reopen_count",
+            "time_worked",
+            "business_duration",
+            "calendar_duration",
+            "made_sla",
+            "u_manager_in_charge_gpn",
+            "u_manager_in_charge_user_name",
+            "u_financial_impact",
+            "u_operational_impact",
+            "u_reputational_impact",
+            "u_regulatory_impact",
+            "u_regulators_informed",
+            "u_impacted_country",
+            "sys_created_on",
+            "sys_updated_on",
+            "sys_updated_by",
+            "resolved_by_user_name",
+            "resolved_by_gpn",
+            "close_notes",
+            "knowledge",
+            "parent",
+            "origin_table",
+            "contact_type",
+        ]
+        
+        # Normalize timezone format and parse ISO-8601
+        normalized_expr = f"regexp_replace({date_col}, '(.*)([+-]\\\\d{{2}})(\\\\d{{2}})$', '\\\\1\\\\2:\\\\3')"
+        parse_iso = f"from_iso8601_timestamp({normalized_expr})"
+
+        # Exclusion clause for automation creators (opened_by_user_name)
+        if self.exclude_opened_by_usernames:
+            atlas_excl_list_sql = ", ".join([f"'{x}'" for x in self.exclude_opened_by_usernames])
+            opened_by_exclusion_sql = (
+                f"AND COALESCE(LOWER(TRIM(opened_by_user_name)), '') NOT IN ({atlas_excl_list_sql})"
+            )
+        else:
+            opened_by_exclusion_sql = ""
+        
+        # Build column list
+        col_list_sql = ", ".join([f'"{c}"' for c in atlas_columns])
+        
+        # First, let's check what values exist in opened_by_user_name (debug)
+        try:
+            print(f"\n🔍 DEBUG: Top opened_by_user_name values in Atlas (DH, date window)...")
+            debug_query = f"""
+            SELECT DISTINCT opened_by_user_name, COUNT(*) as count
+            FROM {fqtn}
+            WHERE {normalized_expr} IS NOT NULL
+              AND {parse_iso} >= TIMESTAMP '{self.start_date} 00:00:00'
+              AND {parse_iso} <  TIMESTAMP '{self.end_date} 00:00:00'
+              AND assignment_group LIKE 'DH-%'
+              AND opened_by_user_name IS NOT NULL
+            GROUP BY opened_by_user_name
+            ORDER BY count DESC
+            LIMIT 20
+            """
+            debug_result = self.atlas_session.sql(debug_query).to_pandas()
+            if not debug_result.empty:
+                print("📋 Found opened_by_user_name values:")
+                print(debug_result.to_string(index=False))
+            else:
+                print("⚠️ No opened_by_user_name values found")
+        except Exception as e:
+            print(f"⚠️ Could not check opened_by_user_name values: {e}")
+        
+        # Count query
+        count_query = f"""
+        SELECT COUNT(*) as record_count
+        FROM {fqtn}
+        WHERE {normalized_expr} IS NOT NULL
+          AND {parse_iso} >= TIMESTAMP '{self.start_date} 00:00:00'
+          AND {parse_iso} <  TIMESTAMP '{self.end_date} 00:00:00'
+          AND assignment_group LIKE 'DH-%'
+          {opened_by_exclusion_sql}
+        """
+        
+        try:
+            print(f"\n🔍 Getting record count for Atlas (DH, date window)...")
+            count_result = self.atlas_session.sql(count_query).to_pandas()
+            total_count = count_result['record_count'].iloc[0]
+            print(f"📊 Total Atlas records to fetch: {total_count:,}")
+            
+            if total_count == 0:
+                print("\n⚠️ No Atlas records found for DH in the selected window (after exclusions).")
+                return None
+            
+            print(f"⏱️ Fetching {total_count:,} Atlas records...")
+            
+            # Full data query
+            query = f"""
+            SELECT {col_list_sql}
+            FROM {fqtn}
+            WHERE {normalized_expr} IS NOT NULL
+              AND {parse_iso} >= TIMESTAMP '{self.start_date} 00:00:00'
+              AND {parse_iso} <  TIMESTAMP '{self.end_date} 00:00:00'
+              AND assignment_group LIKE 'DH-%'
+              {opened_by_exclusion_sql}
+            ORDER BY {parse_iso} DESC
+            """
+            
+            df_atlas = self.atlas_session.sql(query).to_pandas()
+            print(f"✅ Retrieved {len(df_atlas):,} Atlas records | Columns: {len(df_atlas.columns)}")
+            
+            # Add data source identifier
+            df_atlas['data_source'] = 'Atlas'
+            
+            return df_atlas
+            
+        except Exception as e:
+            print(f"❌ Error fetching Atlas data: {e}")
+            traceback.print_exc()
+            return None
+    
+    def fetch_gsnow_data(self):
+        """Fetch data from gsnow for DH assignment groups within the configured date window."""
+        print("\n" + "=" * 80)
+        print("📥 FETCHING GSNOW DATA")
+        print("=" * 80)
+        print(f"📅 Period: {self.start_date} to {self.end_date} (end exclusive)")
+        
+        if not self.gsnow_session:
+            print("❌ No gsnow session available")
+            return None
+        
+        schema = "ts_dwh_gsnow_schema"
+        table = "gsnow_inc_main_unstrreq_36mth"
+        table_ref = f"{schema}.{table}"
+        date_col = "opened_at"
+        
+        # Define all columns for gsnow
+        gsnow_columns = [
+            "inc_number",
+            "assigned_grp",
+            "business_impact",
+            "category",
+            "closed_at",
+            "contact_type",
+            "created_on",
+            "opened_at",
+            "operational_impact",
+            "inc_priority",
+            "resolution_sla_name",
+            "resolved_at",
+            "response_ola_name",
+            "service_impacted",
+            "service_impacted_id",
+            "service_owner_grp",
+            "severity",
+            "short_description",
+            "state",
+            "type",
+            "updated_on",
+            "urgency",
+            "creator_bus_name",
+            "creator_gpn",
+            "service_environment",
+            "impacted_country",
+            "description",
+            "sub-category",
+            "ola_created_by_bus_name",
+            "ola_created_by_gpn",
+            "1st_assigned_grp",
+            "updated_by_gpn",
+            "business_impact_severity",
+            "swci",
+            "swci_id",
+            "swc",
+            "swc_id",
+            "bcm_criticality_tier_rating",
+            "solution",
+            "solution_id",
+            "solution_domain_mgr",
+            "solution_domain_mgr_gpn",
+            "solution_domain",
+            "solution_domain_id",
+            "business_cluster_owner",
+            "business_cluster_owner_gpn",
+            "business_cluster",
+            "business_cluster_id",
+            "it_sector_cio",
+            "it_sector",
+            "business_stream_prg_mgr",
+            "business_stream_prg_mgr_gpn",
+            "business_stream",
+            "business_stream_id",
+            "service_division_id",
+            "service_division",
+            "attached_kb_number",
+            "related_item",
+            "source_name",
+            "incremental_field",
+            "ext_name",
+            "service_type",
+            "technology_bcm_tier",
+            "resolved_by_name",
+        ]
+        
+        # Build column list
+        col_list_sql = ", ".join([f'"{c}"' for c in gsnow_columns])
+
+        # Exclusion clause for automation creators (creator_bus_name)
+        if self.exclude_gsnow_creator_bus_names:
+            gsnow_excl_list_sql = ", ".join([f"'{x}'" for x in self.exclude_gsnow_creator_bus_names])
+            creator_exclusion_sql = (
+                f"AND COALESCE(LOWER(TRIM(creator_bus_name)), '') NOT IN ({gsnow_excl_list_sql})"
+            )
+        else:
+            creator_exclusion_sql = ""
+        
+        # Count query first
+        count_query = f"""
+        SELECT COUNT(*) as record_count
+        FROM {table_ref}
+        WHERE {date_col} >= DATE '{self.start_date}'
+          AND {date_col} <  DATE '{self.end_date}'
+          AND assigned_grp LIKE 'DH-%'
+          {creator_exclusion_sql}
+        """
+        
+        try:
+            print(f"🔍 Getting record count for gsnow (DH, date window)...")
+            count_result = self.gsnow_session.sql(count_query).to_pandas()
+            total_count = count_result['record_count'].iloc[0]
+            print(f"📊 Total gsnow records to fetch: {total_count:,}")
+            
+            if total_count == 0:
+                print("⚠️ No gsnow records found for DH in the selected window (after exclusions).")
+                return None
+            
+            print(f"⏱️ Fetching {total_count:,} gsnow records...")
+            
+            # Full data query
+            query = f"""
+            SELECT {col_list_sql}
+            FROM {table_ref}
+            WHERE {date_col} >= DATE '{self.start_date}'
+              AND {date_col} <  DATE '{self.end_date}'
+              AND assigned_grp LIKE 'DH-%'
+              {creator_exclusion_sql}
+            ORDER BY {date_col} DESC
+            """
+            
+            df_gsnow = self.gsnow_session.sql(query).to_pandas()
+            print(f"✅ Retrieved {len(df_gsnow):,} gsnow records | Columns: {len(df_gsnow.columns)}")
+            
+            # Add data source identifier
+            df_gsnow['data_source'] = 'gsnow'
+            
+            return df_gsnow
+            
+        except Exception as e:
+            print(f"❌ Error fetching gsnow data: {e}")
+            traceback.print_exc()
+            return None
+    
+    def map_and_combine(self, df_atlas, df_gsnow):
+        """
+        Map gsnow columns to Atlas columns and combine datasets.
+        Atlas is the PRIMARY source - gsnow data is mapped to match Atlas structure.
+        """
+        print("\n" + "=" * 80)
+        print("🔄 MAPPING COLUMNS AND COMBINING DATASETS")
+        print("=" * 80)
+        print("📌 Atlas is PRIMARY - gsnow will be mapped to Atlas column structure")
+        
+        if df_atlas is None and df_gsnow is None:
+            print("❌ No data from either source")
+            return None
+        
+        if df_atlas is None:
+            print("⚠️ Warning: No Atlas data available. Cannot proceed without primary source.")
+            return None
+        
+        column_mapping = self.get_column_mapping()
+        
+        # Atlas columns are the standard (PRIMARY source)
+        atlas_columns = list(df_atlas.columns)
+        
+        # Use Atlas column structure as the base
+        standard_columns = atlas_columns.copy()
+        
+        print(f"\n📋 Atlas (PRIMARY) columns: {len(standard_columns)}")
+        print(f"✅ Atlas data: {len(df_atlas):,} records with {len(df_atlas.columns)} columns")
+        
+        # Process gsnow data - map ALL columns to Atlas structure
+        if df_gsnow is not None:
+            print(f"\n✅ gsnow data: {len(df_gsnow):,} records with {len(df_gsnow.columns)} columns")
+            print("🔄 Mapping gsnow columns to Atlas structure...")
+            
+            df_gsnow_mapped = pd.DataFrame()
+            
+            # Create reverse mapping: Atlas column -> gsnow column
+            reverse_mapping = {v: k for k, v in column_mapping.items() if v is not None}
+            
+            # Map each Atlas column to gsnow if mapping exists
+            for atlas_col in standard_columns:
+                if atlas_col == 'data_source':
+                    df_gsnow_mapped[atlas_col] = df_gsnow.get('data_source', 'gsnow')
+                elif atlas_col in reverse_mapping:
+                    # Map from gsnow column name to Atlas column name
+                    gsnow_col = reverse_mapping[atlas_col]
+                    if gsnow_col in df_gsnow.columns:
+                        df_gsnow_mapped[atlas_col] = df_gsnow[gsnow_col]
+                    else:
+                        df_gsnow_mapped[atlas_col] = None
+                else:
+                    # Atlas column doesn't have a gsnow mapping, set to None
+                    df_gsnow_mapped[atlas_col] = None
+            
+            df_gsnow = df_gsnow_mapped
+            print(f"✅ gsnow columns mapped to Atlas structure: {len(df_gsnow.columns)} columns")
+        else:
+            print("\n⚠️ No gsnow data available - will only export Atlas data")
+        
+        # Combine datasets - Atlas FIRST (primary), then gsnow (supplementary)
+        print(f"\n🔀 Combining datasets (Atlas PRIMARY + gsnow supplementary)...")
+        dataframes = []
+        
+        # Add Atlas data FIRST (primary source)
+        if df_atlas is not None:
+            dataframes.append(df_atlas[standard_columns])
+            print(f"   📊 Added {len(df_atlas):,} Atlas records (PRIMARY)")
+        
+        # Add gsnow data SECOND (supplementary, mapped to Atlas structure)
+        if df_gsnow is not None and len(df_gsnow) > 0:
+            dataframes.append(df_gsnow[standard_columns])
+            print(f"   📊 Added {len(df_gsnow):,} gsnow records (supplementary)")
+        
+        if not dataframes:
+            print("❌ No dataframes to combine")
+            return None
+        
+        df_combined = pd.concat(dataframes, ignore_index=True)
+        print(f"\n✅ Combined dataset: {len(df_combined):,} total records")
+        print(f"   - Atlas (PRIMARY): {len(df_atlas):,} records")
+        if df_gsnow is not None:
+            print(f"   - gsnow (supplementary): {len(df_gsnow):,} records")
+        
+        # Handle duplicates: If same incident_number exists in both sources, prioritize Atlas
+        initial_count = len(df_combined)
+        if 'incident_number' in df_combined.columns:
+            # Remove duplicates, keeping Atlas records first (they come first in the concat)
+            # Mark priority: Atlas = 1, gsnow = 2
+            df_combined['_priority'] = df_combined['data_source'].map({'Atlas': 1, 'gsnow': 2})
+            df_combined = df_combined.sort_values('_priority').drop_duplicates(
+                subset=['incident_number'], 
+                keep='first'  # Keep first = keep Atlas (priority 1)
+            )
+            df_combined = df_combined.drop(columns=['_priority'])
+        
+        final_count = len(df_combined)
+        removed = initial_count - final_count
+        if removed > 0:
+            print(f"🔍 Removed {removed:,} duplicate incident_numbers (kept Atlas records)")
+        
+        return df_combined
+    
+    def get_ticket_hash(self, short_desc, description):
+        """Create hash for caching similar tickets"""
+        combined = f"{str(short_desc)}|{str(description)}"
+        return hashlib.md5(combined.encode()).hexdigest()
+    
+    def clean_description_rca(self, text):
+        """
+        Enhanced description cleaning with RCA focus.
+        Full implementation from category_latest.py
+        """
+        if pd.isna(text) or text is None:
+            return ""
+        
+        text = str(text).strip()
+        if not text:
+            return ""
+        
+        # Special case: Alerts Summary + Strike patterns
+        alerts_summary_match = re.search(
+            r"Alerts Summary:.*?Critical, \d+.*?Warning, \d+.*?Resolved", text
+        )
+        strike_pattern_match = re.search(
+            r"strike\[\d+\] Failure On", text, re.IGNORECASE
+        )
+        
+        if alerts_summary_match and strike_pattern_match:
+            return "Backup issue - Strike"
+        elif alerts_summary_match:
+            return None  # Return None to trigger fallback
+        
+        # Dictionary of patterns to capture from Severity= patterns
+        capture_patterns = {
+            "AlertGroup": r"AlertGroup=([^,]+)",
+            "Domain": r"Domain=([^,]+)",
+            "AlertKey": r"AlertKey=([^,]+)",
+            "Agent": r"Agent=([^,]+)"
+        }
+        
+        # If the description contains 'Severity=' extract matching fields
+        if re.search(r"Severity=[^\s,]+", text):
+            extracted_values = []
+            for label, pattern in capture_patterns.items():
+                matches = re.findall(pattern, text)
+                extracted_values.extend([f"{label}: {match.strip()}" for match in matches])
+            if extracted_values:
+                return " ".join(extracted_values)
+        
+        # Preserve critical RCA patterns before cleaning
+        rca_patterns = {
+            'Memory': r'memory\s+utilization|memory\s+usage|memavailable|%swpused',
+            'CPU': r'cpu\s+utilization|cpu\s+usage|cpu\s+monitor',
+            'Heartbeat': r'heartbeat\s+down|heartbeat\s+from.*is\s+down',
+            'Database': r'database.*running\s+out\s+of\s+space|database.*out\s+of\s+space|standby\s+database.*behind',
+            'Backup': r'backup\s+issue|commvault.*backup.*failed|strike.*failure.*subclient',
+            'Filesystem': r'filesystem.*threshold|filesystem.*space.*warning|filesystem.*space.*critical',
+            'Server': r'server\s+down|ping\s+failed.*server',
+            'Service': r'service.*not\s+running',
+        }
+        
+        # Extract RCA keywords
+        rca_keywords = []
+        for pattern_name, pattern in rca_patterns.items():
+            if re.search(pattern, text, re.IGNORECASE):
+                rca_keywords.append(pattern_name)
+        
+        # Basic cleaning
+        text = re.sub(r'\[Issue category:.*?\]', '', text)
+        text = re.sub(r'No CID Disclaimer accepted:.*', '', text)
+        text = re.sub(r'Topic:.*', '', text)
+        text = re.sub(r'user details:.*', '', text)
+        text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '', text)
+        text = text.replace('\n', '. ')
+        
+        # Add RCA keywords to cleaned text
+        if rca_keywords:
+            text = f"{' '.join(rca_keywords)} {text}"
+        
+        return text.strip()
+    
+    def extract_keywords_yake(self, text, use_hybrid=True, top_keywords=12):
+        """Extract keywords using YAKE (from category_latest.py)"""
+        if not YAKE_AVAILABLE:
+            return self.extract_simple_keywords(text)
+        
+        if not text or pd.isna(text):
+            return ""
+        
+        text_str = str(text).strip()
+        if not text_str or text_str == 'nan' or text_str == 'None':
+            return ""
+        
+        try:
+            stopwords = {'the', 'and', 'is', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+            all_keywords = []
+            
+            if use_hybrid:
+                # Bigrams
+                try:
+                    kw_extractor = KeywordExtractor(lan="en", n=2, top=4, stopwords=stopwords, windowsSize=2, dedupLim=0.9)
+                    keywords = kw_extractor.extract_keywords(text_str)
+                    if keywords:
+                        all_keywords.extend([kw[1] for kw in keywords[:4]])
+                except:
+                    pass
+                
+                # Unigrams
+                try:
+                    kw_extractor = KeywordExtractor(lan="en", n=1, top=6, stopwords=stopwords, windowsSize=1, dedupLim=0.9)
+                    keywords = kw_extractor.extract_keywords(text_str)
+                    if keywords:
+                        all_keywords.extend([kw[1] for kw in keywords[:6]])
+                except:
+                    pass
+            
+            # Remove duplicates
+            seen = set()
+            unique_keywords = []
+            for kw in all_keywords:
+                kw_lower = kw.lower().strip()
+                if kw_lower and kw_lower not in seen:
+                    seen.add(kw_lower)
+                    unique_keywords.append(kw)
+            
+            final_keywords = unique_keywords[:top_keywords]
+            return " ".join(final_keywords) if final_keywords else ""
+        except:
+            return self.extract_simple_keywords(text)
+    
+    def extract_simple_keywords(self, text):
+        """Simple keyword extraction as fallback"""
+        if not text or pd.isna(text):
+            return ""
+        text_str = str(text).strip()
+        if not text_str:
+            return ""
+        common_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had'}
+        words = text_str.lower().split()
+        keywords = [re.sub(r'[^a-zA-Z0-9]', '', word) for word in words 
+                   if len(re.sub(r'[^a-zA-Z0-9]', '', word)) > 3 and word not in common_words]
+        return " ".join(keywords[:5])
+    
+    def categorize_with_gpt(self, short_desc, description, api_key=None, deployment_name=None):
+        """Categorize using GPT-4o-mini (from category_latest.py)"""
+        if not OPENAI_AVAILABLE:
+            return "GPT Not Available"
+        
+        api_key = api_key or AZURE_API_KEY
+        if not api_key:
+            return "No API Key"
+        
+        # Check cache
+        ticket_hash = self.get_ticket_hash(short_desc, description)
+        with gpt_cache_lock:
+            if ticket_hash in gpt_cache:
+                return gpt_cache[ticket_hash]
+        
+        try:
+            client = AzureOpenAI(api_key=api_key, api_version=AZURE_API_VERSION, azure_endpoint=AZURE_ENDPOINT)
+            
+            short_desc_text = str(short_desc) if not pd.isna(short_desc) else "N/A"
+            desc_text = str(description) if description and not pd.isna(description) else ""
+            
+            if desc_text and desc_text != "N/A":
+                combined_text = f"Short Description: {short_desc_text}\n\nFull Description: {desc_text}"
+            else:
+                combined_text = f"Description: {short_desc_text}"
+            
+            system_prompt = """You are an expert IT incident analyst specializing in Root Cause Analysis (RCA) categorization.
+Analyze the incident and provide a precise, concise RCA category name (2-5 words max).
+Focus on the ROOT CAUSE, not symptoms."""
+            
+            user_prompt = f"""Incident Details:
+{combined_text}
+
+Provide the RCA category name:"""
+            
+            response = client.chat.completions.create(
+                model=deployment_name or GPT_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=50,
+                timeout=30
+            )
+            
+            category = response.choices[0].message.content.strip()
+            category = re.sub(r'^["\']|["\']$', '', category)
+            category = ' '.join(category.split())
+            
+            if category and len(category) < 100:
+                with gpt_cache_lock:
+                    gpt_cache[ticket_hash] = category
+                return category
+            else:
+                return "Categorization Failed"
+        except Exception as e:
+            return "Categorization Failed"
+    
+    def cluster_categories_with_gpt(self, categories_batch, api_key, deployment_name=None, max_retries=3):
+        """
+        Use GPT to cluster similar categories and return representative names.
+        Processes a batch of categories together for efficiency.
+        """
+        if not OPENAI_AVAILABLE:
+            return {}
+        
+        # Check cache first
+        batch_hash = hashlib.md5(json.dumps(sorted(categories_batch), sort_keys=True).encode()).hexdigest()
+        cache_key = f"gpt_cluster_{batch_hash}"
+        
+        with gpt_cache_lock:
+            if cache_key in gpt_cache:
+                return gpt_cache[cache_key]
+        
+        try:
+            client = AzureOpenAI(api_key=api_key, api_version=AZURE_API_VERSION, azure_endpoint=AZURE_ENDPOINT)
+            
+            categories_list = "\n".join([f"- {cat}" for cat in categories_batch])
+            
+            prompt = f"""You are clustering IT incident categories. Group similar categories together and provide a representative name for each group.
+
+Categories to cluster:
+{categories_list}
+
+Rules:
+1. Categories with same BASE_PHRASE and same SYSTEM should be merged
+2. Categories with same BASE_PHRASE but different SYSTEMS should be separate
+3. Categories with ROOT_CAUSE modifiers (like "Due to Disk Space") should be separate
+4. Remove noise words like "Alert", "Resource", "Warning" from representative names
+5. Use concise, clear representative names (2-5 words preferred)
+
+Return JSON format:
+{{
+  "groups": [
+    {{
+      "representative": "High CPU Utilization",
+      "categories": ["High CPU Utilization", "High CPU Resource Utilization", "High CPU Utilization Alert"]
+    }},
+    {{
+      "representative": "High CPU Utilization on SQL Server",
+      "categories": ["High CPU Utilization MSSQL", "High CPU Utilization on SQL Server"]
+    }}
+  ]
+}}
+
+Return ONLY valid JSON, no other text."""
+
+            for attempt in range(max_retries):
+                try:
+                    response = client.chat.completions.create(
+                        model=deployment_name or GPT_MODEL,
+                        messages=[
+                            {"role": "system", "content": "You are an expert at clustering IT incident categories. Return only valid JSON."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                        response_format={"type": "json_object"},
+                        max_tokens=2000,
+                        timeout=60
+                    )
+                    
+                    result_json = response.choices[0].message.content.strip()
+                    result = json.loads(result_json)
+                    
+                    # Convert to category -> representative mapping
+                    category_to_representative = {}
+                    for group in result.get("groups", []):
+                        representative = group.get("representative", "")
+                        categories = group.get("categories", [])
+                        for cat in categories:
+                            category_to_representative[cat] = representative
+                    
+                    # Cache the result
+                    with gpt_cache_lock:
+                        gpt_cache[cache_key] = category_to_representative
+                    
+                    return category_to_representative
+                    
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    else:
+                        print(f"Warning: Failed to parse GPT clustering response: {e}")
+                        return {cat: cat for cat in categories_batch}
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    else:
+                        print(f"Warning: GPT clustering failed: {e}")
+                        return {cat: cat for cat in categories_batch}
+        
+        except Exception as e:
+            print(f"Warning: GPT clustering error: {e}")
+            return {cat: cat for cat in categories_batch}
+        
+        return {cat: cat for cat in categories_batch}
+    
+    def cluster_categories_gpt_batch(self, df, category_column, api_key, deployment_name=None, batch_size=50):
+        """
+        Cluster categories using GPT in batches for efficiency.
+        Returns DataFrame with 'Cluster Group' column added.
+        """
+        if not OPENAI_AVAILABLE:
+            print("Warning: OpenAI not available. Skipping GPT clustering.")
+            return df
+        
+        print(f"\n7️⃣ GPT-based Clustering for {df[category_column].nunique()} unique categories...")
+        print(f"   Processing in batches of {batch_size} categories...")
+        
+        # Get unique categories
+        unique_categories = df[category_column].dropna().unique().tolist()
+        unique_categories = [cat for cat in unique_categories if cat and str(cat).strip()]
+        
+        if not unique_categories:
+            print("   No categories to cluster.")
+            df['Cluster Group'] = df[category_column]
+            return df
+        
+        # Process in batches
+        category_to_representative = {}
+        num_batches = (len(unique_categories) + batch_size - 1) // batch_size
+        
+        print(f"   Processing {num_batches} batches...")
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(unique_categories))
+            batch = unique_categories[start_idx:end_idx]
+            
+            print(f"     Batch {batch_num + 1}/{num_batches} ({len(batch)} categories)...")
+            
+            # Cluster this batch with GPT
+            batch_mapping = self.cluster_categories_with_gpt(batch, api_key, deployment_name)
+            category_to_representative.update(batch_mapping)
+        
+        # Assign cluster groups
+        df['Cluster Group'] = df[category_column].map(category_to_representative).fillna(df[category_column])
+        
+        print(f"\n   ✅ GPT Clustering Results:")
+        print(f"      - Original unique categories: {df[category_column].nunique():,}")
+        print(f"      - Clustered unique groups: {df['Cluster Group'].nunique():,}")
+        print(f"      - Reduction: {df[category_column].nunique() - df['Cluster Group'].nunique():,} categories merged")
+        
+        return df
+    
+    def add_categorization_columns(self, df: pd.DataFrame, use_gpt=True, use_drain3=True) -> pd.DataFrame:
+        """
+        Add categorization columns using ALL techniques from category_latest.py:
+        1. Clean descriptions (clean_description_rca)
+        2. Add Automation_Status column
+        3. Extract keywords (YAKE hybrid)
+        4. Mine templates (Drain3)
+        5. Cluster templates (RapidFuzz)
+        6. Generate logical group names (pattern-based)
+        7. Categorize with GPT-4o-mini
+        8. Cluster categories (GPT only - not RapidFuzz)
+        """
+        if df is None or len(df) == 0:
+            return df
+        
+        print("\n" + "=" * 80)
+        print("🔍 APPLYING FULL CATEGORIZATION (category_latest.py techniques)")
+        print("=" * 80)
+        
+        # Clean descriptions
+        print("\n1️⃣ Cleaning descriptions with RCA focus...")
+        desc_column = 'short_description' if 'short_description' in df.columns else None
+        desc_column_full = 'description' if 'description' in df.columns else None
+        
+        if desc_column:
+            try:
+                tqdm.pandas(desc="Cleaning descriptions")
+                df['cleaned_description'] = df[desc_column].progress_apply(self.clean_description_rca)
+            except:
+                df['cleaned_description'] = df[desc_column].apply(self.clean_description_rca)
+            
+            # Fallback to full description if cleaned is empty
+            if desc_column_full:
+                mask = (df['cleaned_description'].isna()) | (df['cleaned_description'] == "")
+                df.loc[mask, 'cleaned_description'] = df.loc[mask, desc_column_full].apply(self.clean_description_rca)
+        else:
+            df['cleaned_description'] = ""
+        
+        # Add Automation_Status
+        print("\n2️⃣ Adding Automation_Status...")
+        if 'Automation_Status' not in df.columns:
+            if 'opened_by_gpn' in df.columns:
+                elements_to_check = ["Guest", "bigpanda", "IPSoft Techuser", "NETCOOL IMPACT (PROD)"]
+                df['Automation_Status'] = df['opened_by_gpn'].isin(elements_to_check).map({
+                    True: "Automation",
+                    False: "User raised"
+                })
+            else:
+                df['Automation_Status'] = 'Not Found'
+        
+        # Extract keywords using YAKE
+        print("\n3️⃣ Extracting keywords using YAKE...")
+        if YAKE_AVAILABLE:
+            try:
+                tqdm.pandas(desc="Extracting keywords")
+                df['Keywords'] = df['cleaned_description'].progress_apply(
+                    lambda x: self.extract_keywords_yake(x, use_hybrid=True, top_keywords=12)
+                )
+            except:
+                df['Keywords'] = df['cleaned_description'].apply(
+                    lambda x: self.extract_keywords_yake(x, use_hybrid=True, top_keywords=12)
+                )
+        else:
+            print("   ⚠️  YAKE not available, using simple keyword extraction")
+            df['Keywords'] = df['cleaned_description'].apply(self.extract_simple_keywords)
+        
+        # Template mining using Drain3
+        print("\n4️⃣ Mining templates using Drain3...")
+        if DRAIN3_AVAILABLE and use_drain3:
+            try:
+                config = TemplateMinerConfig()
+                config.profiling_enabled = False
+                config.drain_sim_th = 0.35
+                config.drain_max_children = 150
+                config.drain_max_clusters = 2000
+                config.drain_depth = 4
+                
+                template_miner = TemplateMiner(config=config)
+                
+                def extract_template(text):
+                    if not text or pd.isna(text):
+                        return ""
+                    text_str = str(text).strip()
+                    if not text_str or text_str == 'nan':
+                        return ""
+                    try:
+                        result = template_miner.add_log_message(text_str)
+                        if isinstance(result, dict) and 'template' in result and result['template']:
+                            return result['template']
+                        elif isinstance(result, str) and result.strip():
+                            return result.strip()
+                        else:
+                            # Simplified template
+                            text = re.sub(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^:]*:', '', text)
+                            text = re.sub(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', '<IP>', text)
+                            words = text.split()[:8]
+                            return " ".join(words)
+                    except:
+                        words = str(text).split()[:8]
+                        return " ".join(words)
+                
+                tqdm.pandas(desc="Generating templates")
+                df['Template'] = df['cleaned_description'].progress_apply(extract_template)
+                
+                # Cluster templates using RapidFuzz
+                print("   Clustering templates with RapidFuzz...")
+                templates = df['Template'].dropna().unique()
+                template_groups = {}
+                group_id = 1
+                similarity_threshold = 75
+                
+                for template in tqdm(templates, desc="Clustering"):
+                    if not template or template == "":
+                        continue
+                    
+                    best_match = None
+                    best_score = 0
+                    
+                    for existing_template in template_groups.keys():
+                        if existing_template == template:
+                            continue
+                        # Combined similarity
+                        token_set_score = fuzz.token_set_ratio(template, existing_template)
+                        partial_score = fuzz.partial_ratio(template, existing_template)
+                        ratio_score = fuzz.ratio(template, existing_template)
+                        combined_score = (token_set_score * 0.4) + (partial_score * 0.3) + (ratio_score * 0.3)
+                        
+                        if combined_score > best_score:
+                            best_score = combined_score
+                            best_match = existing_template
+                    
+                    if best_match and best_score >= similarity_threshold:
+                        template_groups[template] = template_groups[best_match]
+                    else:
+                        template_groups[template] = f"Group {group_id}"
+                        group_id += 1
+                
+                df['Template Group'] = df['Template'].map(template_groups)
+            except Exception as e:
+                print(f"   ⚠️  Drain3 error: {e}, using empty templates")
+                df['Template'] = ""
+                df['Template Group'] = ""
+        else:
+            print("   ⚠️  Drain3 not available, skipping template mining")
+            df['Template'] = ""
+            df['Template Group'] = ""
+        
+        # GPT-4o-mini categorization (with parallel processing)
+        print("\n5️⃣ Categorizing with GPT-4o-mini (Parallel Processing)...")
+        if OPENAI_AVAILABLE and use_gpt and AZURE_API_KEY:
+            try:
+                print(f"   Processing {len(df):,} incidents with parallel processing...")
+                print(f"   Using ThreadPoolExecutor for concurrent API calls...")
+                
+                # Initialize RCA Category column
+                df['RCA Category'] = ""
+                
+                # Configuration for parallel processing (matching category_latest.py)
+                max_workers = 50  # Number of concurrent threads (same as category_latest.py)
+                batch_size = 1000  # Process in batches of 1000 (matching category_latest.py BATCH_SIZE)
+                
+                total_rows = len(df)
+                num_batches = (total_rows + batch_size - 1) // batch_size
+                
+                def categorize_row_with_index(idx, row):
+                    """Categorize a single row and return index and result"""
+                    result = self.categorize_with_gpt(
+                        row.get(desc_column, ""),
+                        row.get(desc_column_full, ""),
+                        AZURE_API_KEY
+                    )
+                    return idx, result
+                
+                # Process in batches with parallel execution
+                for batch_num in range(num_batches):
+                    start_idx = batch_num * batch_size
+                    end_idx = min(start_idx + batch_size, total_rows)
+                    batch_df = df.iloc[start_idx:end_idx].copy()
+                    
+                    print(f"   Processing batch {batch_num + 1}/{num_batches} (rows {start_idx + 1}-{end_idx})...")
+                    batch_start_time = time.time()
+                    
+                    # Prepare tasks for parallel processing
+                    tasks = []
+                    for idx, row in batch_df.iterrows():
+                        tasks.append((idx, row))
+                    
+                    # Process batch in parallel
+                    results = {}
+                    completed = 0
+                    
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # Submit all tasks
+                        future_to_idx = {
+                            executor.submit(categorize_row_with_index, idx, row): idx 
+                            for idx, row in tasks
+                        }
+                        
+                        # Process completed tasks with progress updates
+                        with tqdm(total=len(tasks), desc=f"Batch {batch_num + 1}", unit="ticket", leave=False) as pbar:
+                            for future in as_completed(future_to_idx):
+                                try:
+                                    idx, category = future.result()
+                                    results[idx] = category
+                                    completed += 1
+                                    
+                                    # Update progress every 10 completions
+                                    if completed % 10 == 0 or completed == len(tasks):
+                                        elapsed = time.time() - batch_start_time
+                                        rate = completed / elapsed * 60 if elapsed > 0 else 0
+                                        pbar.set_postfix({
+                                            'rate': f'{rate:.1f}/min',
+                                            'cache': len([k for k in gpt_cache.keys() if not k.startswith('gpt_cluster_')])
+                                        })
+                                    pbar.update(1)
+                                    
+                                except Exception as e:
+                                    idx = future_to_idx[future]
+                                    results[idx] = "Categorization Failed"
+                                    print(f"   ⚠️  Error processing row {idx}: {e}")
+                                    pbar.update(1)
+                    
+                    # Update main dataframe with results
+                    for idx, category in results.items():
+                        df.loc[idx, 'RCA Category'] = category
+                    
+                    # Batch completion stats
+                    batch_time = time.time() - batch_start_time
+                    batch_rate = len(tasks) / batch_time * 60 if batch_time > 0 else 0
+                    print(f"   ✓ Batch {batch_num + 1} completed in {batch_time:.1f}s ({batch_rate:.1f} tickets/min)")
+                    
+                    # Small delay between batches (matching category_latest.py)
+                    if batch_num < num_batches - 1:  # Don't delay after last batch
+                        time.sleep(0.1)  # 0.1s delay between batches
+                
+                print(f"   ✅ GPT categorization completed (parallel processing)")
+            except Exception as e:
+                print(f"   ⚠️  GPT error: {e}, using pattern-based fallback")
+                traceback.print_exc()
+                df['RCA Category'] = ""
+        else:
+            if not OPENAI_AVAILABLE:
+                print("   ⚠️  OpenAI library not available")
+            elif not AZURE_API_KEY:
+                print("   ⚠️  Azure API key not configured (set AZURE_OPENAI_API_KEY)")
+            df['RCA Category'] = ""
+        
+        # Generate Logical Group Name (pattern-based from category_latest.py)
+        print("\n6️⃣ Generating Logical Group Names...")
+        def generate_logical_group(row):
+            """Generate logical group name from template/keywords"""
+            template = str(row.get('Template', ''))
+            keywords = str(row.get('Keywords', ''))
+            desc = str(row.get('cleaned_description', ''))
+            
+            # Use template if available
+            if template and template != 'nan' and len(template) > 5:
+                words = template.lower().split()[:5]
+                return ' '.join([w for w in words if len(w) > 2])
+            
+            # Fallback to keywords
+            if keywords and keywords != 'nan':
+                return keywords.split()[0] if keywords.split() else "Unknown"
+            
+            # Final fallback
+            return "Unknown"
+        
+        try:
+            tqdm.pandas(desc="Generating logical groups")
+            df['Logical Group Name'] = df.progress_apply(generate_logical_group, axis=1)
+        except:
+            df['Logical Group Name'] = df.apply(generate_logical_group, axis=1)
+        
+        # If RCA Category is empty, use Logical Group Name
+        mask = (df['RCA Category'] == '') | df['RCA Category'].isna()
+        df.loc[mask, 'RCA Category'] = df.loc[mask, 'Logical Group Name']
+        
+        # Cluster categories using GPT (GPT only, not RapidFuzz)
+        if OPENAI_AVAILABLE and use_gpt and AZURE_API_KEY and 'RCA Category' in df.columns:
+            df = self.cluster_categories_gpt_batch(
+                df, 
+                category_column='RCA Category',
+                api_key=AZURE_API_KEY,
+                deployment_name=None,
+                batch_size=50
+            )
+            # Update Logical Group Name with clustered categories
+            if 'Cluster Group' in df.columns:
+                df['Logical Group Name'] = df['Cluster Group'].fillna(df['RCA Category'])
+        else:
+            # No clustering - use RCA Category as-is
+            if 'Cluster Group' not in df.columns:
+                df['Cluster Group'] = df['RCA Category']
+        
+        print("\n✅ Full categorization completed!")
+        print(f"   - Keywords extracted: {df['Keywords'].notna().sum():,}")
+        print(f"   - Templates generated: {df['Template'].notna().sum():,}")
+        print(f"   - Template groups: {df['Template Group'].nunique():,}")
+        print(f"   - RCA Categories: {df['RCA Category'].nunique():,}")
+        print(f"   - Clustered Groups: {df['Cluster Group'].nunique():,}")
+        print(f"   - Logical Groups: {df['Logical Group Name'].nunique():,}")
+        
+        return df
+    
+    def categorize_with_category_latest(self, df: pd.DataFrame, output_csv_path=None) -> pd.DataFrame:
+        """
+        Categorize data using category_latest.py script.
+        Saves to CSV, calls the script, and loads the categorized result.
+        
+        Args:
+            df: DataFrame to categorize
+            output_csv_path: Optional path for output CSV. If None, uses temp file.
+        
+        Returns:
+            Categorized DataFrame
+        """
+        if df is None or len(df) == 0:
+            return df
+        
+        # Get the path to category_latest.py - check both "Categorise" and "categorization" folders
+        script_dir = Path(__file__).parent.parent.resolve()
+        
+        # Try "Categorise" folder first (with 's'), then "categorization" (with 'z') as fallback
+        category_script = None
+        for folder_name in ["Categorise", "categorization", "Categorization"]:
+            potential_path = script_dir / folder_name / "category_latest.py"
+            if potential_path.exists():
+                category_script = potential_path
+                print(f"✅ Found category_latest.py at: {category_script}")
+                break
+        
+        if not category_script:
+            print(f"❌ category_latest.py not found in Categorise/ or categorization/ folder")
+            print(f"   Searched in: {script_dir}")
+            print("   Falling back to inline categorization...")
+            return self.add_categorization_columns(df, use_gpt=True, use_drain3=False)
+        
+        # Create temporary input CSV file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as temp_input:
+            input_csv = temp_input.name
+        
+        # Use provided output path or create temp file
+        if output_csv_path:
+            output_csv = output_csv_path
+        else:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8') as temp_output:
+                output_csv = temp_output.name
+        
+        try:
+            # Save DataFrame to temporary CSV
+            print(f"\n💾 Saving {len(df):,} records to temporary CSV: {input_csv}")
+            df.to_csv(input_csv, index=False, encoding='utf-8')
+            print(f"✅ Saved input CSV ({len(df):,} rows, {len(df.columns)} columns)")
+            
+            # Build command to call category_latest.py
+            # Note: API key is now hardcoded in category_latest.py (OPENAI_API_KEY)
+            # No need to pass API key via command line
+            
+            cmd = [
+                sys.executable,  # Use same Python interpreter
+                str(category_script),
+                '-i', input_csv,
+                '-o', output_csv,
+                '--use-gpt',  # Enable GPT categorization
+                '--cluster-categories',  # Enable category clustering
+                '--cluster-method', 'gpt',  # Use GPT for clustering
+                '--skip-drain3',  # Skip Drain3
+                '--max-workers', '50',  # 50 parallel workers
+            ]
+            
+            print(f"\n🚀 Calling category_latest.py...")
+            print(f"   Command: {' '.join(cmd[:6])} ... [options]")
+            print(f"   Input: {input_csv}")
+            print(f"   Output: {output_csv}")
+            
+            # Run the categorization script
+            start_time = time.time()
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            elapsed_time = time.time() - start_time
+            
+            if result.returncode != 0:
+                print(f"❌ category_latest.py failed with return code {result.returncode}")
+                print(f"\n{'='*80}")
+                print("FULL ERROR OUTPUT FROM category_latest.py:")
+                print(f"{'='*80}")
+                
+                # Show full stderr (not truncated)
+                if result.stderr:
+                    print("STDERR:")
+                    print(result.stderr)
+                    print(f"\n{'-'*80}")
+                
+                # Also show stdout as errors might be printed there
+                if result.stdout:
+                    print("STDOUT (last 2000 chars):")
+                    print(result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout)
+                    print(f"\n{'-'*80}")
+                
+                print(f"{'='*80}\n")
+                print("   Falling back to inline categorization...")
+                return self.add_categorization_columns(df, use_gpt=True, use_drain3=False)
+            
+            print(f"✅ category_latest.py completed in {elapsed_time:.1f}s")
+            
+            # Check if output file exists
+            if not os.path.exists(output_csv):
+                print(f"❌ Output file not found: {output_csv}")
+                print("   Falling back to inline categorization...")
+                return self.add_categorization_columns(df, use_gpt=True, use_drain3=False)
+            
+            # Load categorized CSV
+            print(f"\n📥 Loading categorized data from: {output_csv}")
+            try:
+                df_categorized = pd.read_csv(output_csv, encoding='utf-8')
+            except UnicodeDecodeError:
+                try:
+                    df_categorized = pd.read_csv(output_csv, encoding='latin-1')
+                except:
+                    df_categorized = pd.read_csv(output_csv, encoding='cp1252')
+            
+            print(f"✅ Loaded categorized data: {len(df_categorized):,} rows, {len(df_categorized.columns)} columns")
+            
+            # Show categorization summary
+            if 'RCA Category' in df_categorized.columns:
+                print(f"\n📊 Categorization Summary:")
+                print(f"   - Unique RCA Categories: {df_categorized['RCA Category'].nunique():,}")
+                if 'Logical Group Name' in df_categorized.columns:
+                    print(f"   - Unique Logical Groups: {df_categorized['Logical Group Name'].nunique():,}")
+                if 'Cluster Group' in df_categorized.columns:
+                    print(f"   - Unique Cluster Groups: {df_categorized['Cluster Group'].nunique():,}")
+            
+            return df_categorized
+            
+        except Exception as e:
+            print(f"❌ Error during categorization: {e}")
+            traceback.print_exc()
+            print("   Falling back to inline categorization...")
+            return self.add_categorization_columns(df, use_gpt=True, use_drain3=False)
+        
+        finally:
+            # Clean up temporary input file only (keep output CSV)
+            try:
+                if os.path.exists(input_csv):
+                    os.unlink(input_csv)
+                # Don't delete output_csv - it's the categorized result
+            except:
+                pass
+    
+    def load_to_postgresql(self, df: pd.DataFrame, table_name='Incident_Data', 
+                           database='service_automation_db', truncate=True):
+        """
+        Load DataFrame directly to PostgreSQL table.
+        No CSV files are created.
+        """
+        if not POSTGRES_AVAILABLE:
+            print("❌ PostgreSQL libraries not available")
+            return False
+        
+        if df is None or len(df) == 0:
+            print("❌ No data to load")
+            return False
+        
+        print("\n" + "=" * 80)
+        print("💾 LOADING DATA TO POSTGRESQL")
+        print("=" * 80)
+        
+        # Get PostgreSQL configuration
+        pg_host = os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net')
+        pg_port = os.getenv('PGPORT', '5432')
+        pg_db = database or os.getenv('PGDATABASE', 'service_automation_db')
+        pg_user = os.getenv('PGUSER', 'powerbi_user')
+        pg_password = os.getenv('PGPASSWORD', 'Report@123')
+        
+        try:
+            # Create connection string with URL-encoded password
+            # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
+            if pg_password:
+                # URL-encode the password to handle special characters like @
+                encoded_password = quote_plus(pg_password)
+                connection_string = f"postgresql://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_db}"
+            else:
+                connection_string = f"postgresql://{pg_user}@{pg_host}:{pg_port}/{pg_db}"
+            
+            print(f"📊 Database: {pg_db}")
+            print(f"📋 Table: {table_name}")
+            print(f"🔌 Host: {pg_host}:{pg_port}")
+            print(f"👤 User: {pg_user}")
+            print(f"📈 Rows to insert: {len(df):,}")
+            
+            # Create SQLAlchemy engine
+            print(f"\n⏳ Connecting to PostgreSQL...")
+            engine = create_engine(connection_string, pool_pre_ping=True)
+            
+            # Test connection
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            print("✅ Connected to PostgreSQL successfully")
+            
+            # Check if table exists
+            print(f"\n⏳ Checking if table '{table_name}' exists...")
+            with engine.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' 
+                        AND table_name = '{table_name}'
+                    );
+                """))
+                table_exists = result.fetchone()[0]
+            
+            if not table_exists:
+                print(f"❌ Table '{table_name}' does not exist in database '{pg_db}'")
+                print(f"   Please create the table first using create_incident_data_table.sql")
+                engine.dispose()
+                return False
+            
+            print(f"✅ Table '{table_name}' exists")
+            
+            # Truncate table if requested (for initial load)
+            if truncate:
+                print(f"\n⏳ Truncating table '{table_name}'...")
+                with engine.connect() as conn:
+                    conn.execute(text(f'TRUNCATE TABLE "{table_name}"'))
+                    conn.commit()
+                print(f"✅ Table truncated")
+            
+            # Get actual table column names from information_schema (case-sensitive)
+            print(f"\n⏳ Fetching table column names...")
+            with engine.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT column_name 
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name}'
+                    AND table_schema = 'public'
+                    ORDER BY ordinal_position;
+                """))
+                table_columns = [row[0] for row in result.fetchall()]
+            
+            print(f"✅ Table has {len(table_columns)} columns")
+            
+            # Prepare DataFrame - ensure column names match table (case-sensitive)
+            # PostgreSQL table uses mixed case for some columns (e.g., "Keywords", "Template Group")
+            df_to_insert = df.copy()
+            
+            # Create mapping: DataFrame column (case-insensitive) -> Table column (exact case)
+            column_mapping = {}
+            table_columns_lower = {col.lower(): col for col in table_columns}
+            
+            for df_col in df_to_insert.columns:
+                df_col_lower = df_col.lower()
+                if df_col_lower in table_columns_lower:
+                    table_col = table_columns_lower[df_col_lower]
+                    if df_col != table_col:
+                        column_mapping[df_col] = table_col
+            
+            # Rename DataFrame columns to match table exactly
+            if column_mapping:
+                df_to_insert.rename(columns=column_mapping, inplace=True)
+                print(f"✅ Renamed {len(column_mapping)} columns to match table case: {list(column_mapping.values())[:5]}...")
+            
+            # Filter DataFrame to only include columns that exist in table
+            # Exclude metadata columns (created_at, updated_at) - they have defaults
+            metadata_cols = {'created_at', 'updated_at'}
+            columns_to_insert = [col for col in df_to_insert.columns 
+                                 if col in table_columns and col not in metadata_cols]
+            
+            # Add missing table columns as NULL (for columns that exist in table but not in DataFrame)
+            missing_cols = []
+            for table_col in table_columns:
+                if table_col not in df_to_insert.columns and table_col not in metadata_cols:
+                    df_to_insert[table_col] = None
+                    missing_cols.append(table_col)
+            
+            if missing_cols:
+                print(f"   ⚠️  Added {len(missing_cols)} missing columns as NULL: {missing_cols[:5]}...")
+            
+            # Select only columns that exist in table (in correct order)
+            df_to_insert = df_to_insert[[col for col in table_columns if col not in metadata_cols]].copy()
+            print(f"✅ Prepared {len(df_to_insert.columns)} columns for insertion")
+            
+            # Convert data types to match PostgreSQL schema
+            # Convert boolean columns
+            bool_columns = ['active', 'made_sla']
+            for col in bool_columns:
+                if col in df_to_insert.columns:
+                    df_to_insert[col] = df_to_insert[col].astype(bool)
+            
+            # Convert integer columns
+            int_columns = ['reassignment_count', 'reopen_count']
+            for col in int_columns:
+                if col in df_to_insert.columns:
+                    df_to_insert[col] = pd.to_numeric(df_to_insert[col], errors='coerce').astype('Int64')
+            
+            # Convert numeric columns
+            numeric_columns = ['time_worked', 'business_duration', 'calendar_duration']
+            for col in numeric_columns:
+                if col in df_to_insert.columns:
+                    df_to_insert[col] = pd.to_numeric(df_to_insert[col], errors='coerce')
+            
+            # Convert date columns to datetime if needed
+            date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on']
+            for col in date_columns:
+                if col in df_to_insert.columns:
+                    df_to_insert[col] = pd.to_datetime(df_to_insert[col], errors='coerce')
+            
+            # Insert data
+            print(f"\n⏳ Inserting {len(df_to_insert):,} rows into '{table_name}'...")
+            df_to_insert.to_sql(
+                name=table_name,
+                con=engine,
+                schema='public',
+                if_exists='append',  # Append since we truncated if needed
+                index=False,
+                method='multi',  # Faster insertion
+                chunksize=1000
+            )
+            
+            print(f"✅ Successfully inserted {len(df_to_insert):,} rows")
+            
+            # Verify insertion
+            with engine.connect() as conn:
+                result = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"'))
+                count = result.fetchone()[0]
+                print(f"✅ Verified: {count:,} rows in table")
+            
+            engine.dispose()
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error loading data to PostgreSQL: {e}")
+            traceback.print_exc()
+            return False
+    
+    def run_combination(self):
+        """Main function to fetch and combine data for DH assignment groups within the configured date window."""
+        print("=" * 80)
+        print("🚀 COMBINING ATLAS AND GSNOW DATA")
+        print("=" * 80)
+        print(f"📅 Period: {self.start_date} to {self.end_date} (end exclusive)")
+        print("🏢 Filter: DH- assignment groups")
+        print(f"🚫 Exclusions: Atlas opened_by_user_name not in {self.exclude_opened_by_usernames or '[]'}; gsnow creator_bus_name not in {self.exclude_gsnow_creator_bus_names or '[]'}")
+        print("")
+        
+        # Connect to databases
+        if not self.connect():
+            print("❌ Failed to establish database connections")
+            return None
+        
+        # Fetch data from both sources
+        df_atlas = self.fetch_atlas_data()
+        df_gsnow = self.fetch_gsnow_data()
+        
+        # Map and combine
+        df_combined = self.map_and_combine(df_atlas, df_gsnow)
+        
+        if df_combined is None:
+            print("❌ Failed to combine data")
+            return None
+
+        # Categorize by crew (assignment group buckets)
+        df_combined = self.add_crew_category(df_combined)
+
+        # Derive automation status (Automated/Manual)
+        df_combined = self.add_automation_status(df_combined)
+        
+        # Populate operational_impact from u_operational_impact if available
+        if 'u_operational_impact' in df_combined.columns:
+            if 'operational_impact' not in df_combined.columns:
+                df_combined['operational_impact'] = df_combined['u_operational_impact']
+        else:
+                # Fill null operational_impact with u_operational_impact
+                mask = df_combined['operational_impact'].isna() | (df_combined['operational_impact'] == '')
+                df_combined.loc[mask, 'operational_impact'] = df_combined.loc[mask, 'u_operational_impact']
+        
+        # Categorize using category_latest.py script
+        print("\n" + "=" * 80)
+        print("🔍 CATEGORIZING DATA USING category_latest.py")
+        print("=" * 80)
+        
+        # Generate output CSV path with timestamp
+        output_csv = f"incidents_categorized_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        # Categorize and save directly to CSV
+        df_combined = self.categorize_with_category_latest(df_combined, output_csv_path=output_csv)
+        
+        if df_combined is None:
+            print("❌ Categorization failed")
+            return None
+        
+        # Verify output CSV was created
+        if os.path.exists(output_csv):
+            print(f"\n✅ Categorized CSV saved: {output_csv}")
+            print(f"   - Rows: {len(df_combined):,}")
+            print(f"   - Columns: {len(df_combined.columns)}")
+        else:
+            print(f"⚠️  Warning: Output CSV not found at {output_csv}")
+        
+        print("\n" + "=" * 80)
+        print("✅ DATA EXTRACTION AND CATEGORIZATION COMPLETED")
+        print("=" * 80)
+        print(f"📊 Total records processed: {len(df_combined):,}")
+        print(f"   - Atlas (PRIMARY): {len(df_atlas):,} records" if df_atlas is not None else "   - Atlas (PRIMARY): 0 records")
+        print(f"   - gsnow (supplementary): {len(df_gsnow):,} records" if df_gsnow is not None else "   - gsnow (supplementary): 0 records")
+        print(f"📋 Columns: {len(df_combined.columns)} (Atlas structure + categorization)")
+        print(f"📁 Output CSV: {output_csv}")
+        print(f"\n💡 Next step: Push to database using:")
+        print(f"   python push_incidents_to_postgres.py {output_csv}")
+        
+        # Show data source breakdown
+        if 'data_source' in df_combined.columns:
+            print(f"\n📊 Data source breakdown:")
+            counts = df_combined['data_source'].value_counts()
+            for source, count in counts.items():
+                label = "(PRIMARY)" if source == "Atlas" else "(supplementary)"
+                print(f"   - {source} {label}: {count:,} records")
+
+        # Show crew breakdown
+        if "crew" in df_combined.columns:
+            print("\n👥 Crew breakdown (from assignment_group):")
+            crew_counts = df_combined["crew"].value_counts(dropna=False)
+            for crew, count in crew_counts.items():
+                print(f"   - {crew}: {count:,} records")
+
+        # Show automation status breakdown
+        if "automation_status" in df_combined.columns:
+            print("\n🤖 Automation status breakdown (from resolved_by_user_name):")
+            auto_counts = df_combined["automation_status"].value_counts(dropna=False)
+            for status, count in auto_counts.items():
+                print(f"   - {status}: {count:,} records")
+        
+        return df_combined
+
+
+def main():
+    """Main function"""
+    print("=" * 80)
+    print("INITIAL LOAD: EXTRACT AND CATEGORIZE INCIDENTS")
+    print("=" * 80)
+    print("Extracts data from:")
+    print("  - Atlas: ipm_service_management.ipm_incident_flat")
+    print("  - gsnow: ts_dwh_gsnow.gsnow_inc_main_unstrreq_36mth")
+    print("Date range: 2024-01-01 to current date")
+    print("Categorization: Uses category_latest.py with GPT clustering")
+    print("Output: Categorized CSV file (use push_incidents_to_postgres.py to load to database)")
+    print("")
+    
+    # Initialize loader
+    loader = InitialLoadIncidents()
+    
+    # Run extraction and categorization
+    result = loader.run_combination()
+    
+    if result is not None:
+        print(f"\n✅ Initial load completed successfully!")
+        print(f"📊 Processed {len(result):,} records")
+        print(f"💡 Use push_incidents_to_postgres.py to push the CSV to database")
+    else:
+        print("\n❌ Initial load failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
