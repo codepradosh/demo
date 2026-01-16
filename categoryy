@@ -23,13 +23,29 @@ import traceback
 # Add categorization directory to path to import category_latest functions
 SCRIPT_DIR = Path(__file__).parent
 CATEGORIZATION_DIR = SCRIPT_DIR / "categorization"
+DATA_EXTRACTION_DIR = SCRIPT_DIR / "data_extraction"
+
+# Add both directories to path for flexible imports
 sys.path.insert(0, str(CATEGORIZATION_DIR))
+sys.path.insert(0, str(DATA_EXTRACTION_DIR))
 
 # Import data extraction class
-from data_extraction.initial_load_incidents import InitialLoadIncidents
+# Try both import paths to support different folder structures
+try:
+    # Local structure: data_extraction/initial_load_incidents.py
+    from data_extraction.initial_load_incidents import InitialLoadIncidents
+except ImportError:
+    try:
+        # AWS structure: all files in data_extraction folder
+        from initial_load_incidents import InitialLoadIncidents
+    except ImportError as e:
+        print(f"Error: Could not import InitialLoadIncidents: {e}")
+        raise
 
 # Import categorization functions from category_latest
+# Try both import paths to support different folder structures
 try:
+    # Local structure: categorization/category_latest.py
     from category_latest import (
         categorize_with_gpt4o_mini,
         cluster_categories_gpt_batch,
@@ -44,9 +60,26 @@ try:
         KEYWORDS
     )
     CATEGORIZATION_AVAILABLE = True
-except ImportError as e:
-    print(f"Warning: Could not import categorization functions: {e}")
-    CATEGORIZATION_AVAILABLE = False
+except ImportError:
+    try:
+        # AWS structure: category_latest.py in data_extraction folder
+        from data_extraction.category_latest import (
+            categorize_with_gpt4o_mini,
+            cluster_categories_gpt_batch,
+            clean_description_rca,
+            extract_keywords_yake_rca,
+            OPENAI_API_KEY,
+            OPENAI_DEPLOYMENT_NAME,
+            OPENAI_ENDPOINT,
+            RCA_CATEGORY,
+            CLUSTER_GROUP,
+            CLEANED_DESCRIPTION,
+            KEYWORDS
+        )
+        CATEGORIZATION_AVAILABLE = True
+    except ImportError as e:
+        print(f"Warning: Could not import categorization functions: {e}")
+        CATEGORIZATION_AVAILABLE = False
 
 
 class ExtractAndCategorize:
