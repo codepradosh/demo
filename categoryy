@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+Extract and Categorize Pipeline
+Extracts incident data from Atlas/gsnow and categorizes with GPT-5-nano
+
+Workflow:
+1. Extract T-1 data from Atlas and gsnow databases
+2. Map and combine datasets
+3. Add crew categorization and automation status
+4. Export to CSV
+5. Categorize with GPT-5-nano (cluster-method: gpt, skip-drain3, max-workers: 50)
+6. Save categorized data to CSV
+"""
+
+import os
+import sys
+import datetime
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import traceback
+
+# Add categorization directory to path to import category_latest functions
+SCRIPT_DIR = Path(__file__).parent
+CATEGORIZATION_DIR = SCRIPT_DIR / "categorization"
+sys.path.insert(0, str(CATEGORIZATION_DIR))
+
+# Import data extraction class
+from data_extraction.initial_load_incidents import InitialLoadIncidents
+
+# Import categorization functions from category_latest
+try:
+    from category_latest import (
+        categorize_with_gpt4o_mini,
+        cluster_categories_gpt_batch,
+        clean_description_rca,
+        extract_keywords_yake_rca,
+        OPENAI_API_KEY,
+        OPENAI_DEPLOYMENT_NAME,
+        OPENAI_ENDPOINT,
+        RCA_CATEGORY,
+        CLUSTER_GROUP,
+        CLEANED_DESCRIPTION,
+        KEYWORDS
+    )
+    CATEGORIZATION_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import categorization functions: {e}")
+    CATEGORIZATION_AVAILABLE = False
+
+
+class ExtractAndCategorize:
+    """
+    Integrated pipeline for data extraction and GPT categorization
+    """
+    
+    def __init__(self, output_dir=None, use_env_vars=True):
+        """
+        Initialize the pipeline
+        
+        Args:
+            output_dir: Directory to save CSV files (default: Service_Catalog/output)
+            use_env_vars: Whether to use environment variables for configuration
+        """
+        self.use_env_vars = use_env_vars
+        
+        # Set output directory
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = SCRIPT_DIR / "output"
+        
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize data extractor
+        self.extractor = InitialLoadIncidents(
+            project_source=str(SCRIPT_DIR.parent) if SCRIPT_DIR.parent.exists() else None,
+            use_env_vars=use_env_vars
+        )
+        
+        print("✅ Extract and Categorize Pipeline initialized")
+        print(f"📁 Output directory: {self.output_dir}")
+    
+    def extract_data(self):
+        """
+        Extract data from Atlas and gsnow databases
+        
+        Returns:
+            DataFrame with combined data, or None if extraction fails
+        """
+        print("\n" + "=" * 80)
+        print("📥 STEP 1: EXTRACTING DATA FROM DATABASES")
+        print("=" * 80)
+        
+        # Connect to databases
+        if not self.extractor.connect():
+            print("❌ Failed to establish database connections")
+            return None
+        
+        # Fetch data from both sources
+        df_atlas = self.extractor.fetch_atlas_data()
+        df_gsnow = self.extractor.fetch_gsnow_data()
+        
+        # Map and combine
+        df_combined = self.extractor.map_and_combine(df_atlas, df_gsnow)
+        
+        if df_combined is None:
+            print("❌ Failed to combine data")
+            return None
+        
+        # Add crew categorization
+        df_combined = self.extractor.add_crew_category(df_combined)
+        
+        # Add automation status
+        df_combined = self.extractor.add_automation_status(df_combined)
+        
+        # Populate operational_impact from u_operational_impact if available
+        if 'u_operational_impact' in df_combined.columns:
+            if 'operational_impact' not in df_combined.columns:
+                df_combined['operational_impact'] = df_combined['u_operational_impact']
+            else:
+                mask = df_combined['operational_impact'].isna() | (df_combined['operational_impact'] == '')
+                df_combined.loc[mask, 'operational_impact'] = df_combined.loc[mask, 'u_operational_impact']
+        
+        print(f"\n✅ Data extraction completed: {len(df_combined):,} records")
+        return df_combined
+    
+    def export_to_csv(self, df, filename=None):
+        """
+        Export DataFrame to CSV
+        
+        Args:
+            df: DataFrame to export
+            filename: Optional filename (default: incidents_YYYYMMDD_HHMMSS.csv)
+        
+        Returns:
+            Path to saved CSV file
+        """
+        print("\n" + "=" * 80)
+        print("💾 STEP 2: EXPORTING TO CSV")
+        print("=" * 80)
+        
+        if df is None or len(df) == 0:
+            print("❌ No data to export")
+            return None
+        
+        # Generate filename if not provided
+        if filename is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"incidents_{timestamp}.csv"
+        
+        csv_path = self.output_dir / filename
+        
+        try:
+            # Export to CSV
+            df.to_csv(csv_path, index=False, encoding='utf-8')
+            print(f"✅ Exported {len(df):,} records to: {csv_path}")
+            print(f"   Columns: {len(df.columns)}")
+            print(f"   File size: {csv_path.stat().st_size / 1024 / 1024:.2f} MB")
+            return csv_path
+        except Exception as e:
+            print(f"❌ Error exporting to CSV: {e}")
+            traceback.print_exc()
+            return None
+    
+    def categorize_with_gpt(self, df, max_workers=50, cluster_method='gpt'):
+        """
+        Categorize incidents using GPT-5-nano
+        
+        Args:
+            df: DataFrame with incident data
+            max_workers: Number of parallel workers (default: 50)
+            cluster_method: Clustering method ('gpt', 'rapidfuzz', or 'both')
+        
+        Returns:
+            DataFrame with categorization columns added
+        """
+        print("\n" + "=" * 80)
+        print("🤖 STEP 3: CATEGORIZING WITH GPT-5-NANO")
+        print("=" * 80)
+        
+        if not CATEGORIZATION_AVAILABLE:
+            print("❌ Categorization functions not available")
+            return df
+        
+        # Check API key
+        if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
+            print("❌ Azure OpenAI API key not configured")
+            print("   Please update OPENAI_API_KEY in category_latest.py")
+            return df
+        
+        print(f"📊 Processing {len(df):,} incidents")
+        print(f"🔧 Configuration:")
+        print(f"   - Model: {OPENAI_DEPLOYMENT_NAME}")
+        print(f"   - Endpoint: {OPENAI_ENDPOINT}")
+        print(f"   - Max workers: {max_workers}")
+        print(f"   - Cluster method: {cluster_method}")
+        print(f"   - Skip Drain3: Yes (for speed)")
+        
+        # Find description columns
+        desc_column = None
+        if 'short_description' in df.columns:
+            desc_column = 'short_description'
+        elif 'Short_Description' in df.columns:
+            desc_column = 'Short_Description'
+        else:
+            print("❌ Required column 'short_description' not found")
+            return df
+        
+        desc_column_full = None
+        if 'description' in df.columns:
+            desc_column_full = 'description'
+        elif 'DESCRIPTION' in df.columns:
+            desc_column_full = 'DESCRIPTION'
+        
+        # Step 1: Clean descriptions
+        print("\n1️⃣ Cleaning descriptions with RCA focus...")
+        from tqdm import tqdm
+        tqdm.pandas(desc="Cleaning descriptions")
+        
+        df[CLEANED_DESCRIPTION] = df[desc_column].progress_apply(clean_description_rca)
+        
+        # Fallback to full description if cleaned is empty
+        if desc_column_full:
+            mask = (df[CLEANED_DESCRIPTION].isna()) | (df[CLEANED_DESCRIPTION] == "")
+            df.loc[mask, CLEANED_DESCRIPTION] = df.loc[mask, desc_column_full].apply(clean_description_rca)
+        
+        print(f"   ✅ Cleaned {len(df):,} descriptions")
+        
+        # Step 2: Extract keywords (optional, for reference)
+        print("\n2️⃣ Extracting keywords with YAKE...")
+        tqdm.pandas(desc="Extracting keywords")
+        df[KEYWORDS] = df[CLEANED_DESCRIPTION].progress_apply(
+            lambda x: extract_keywords_yake_rca(x, use_hybrid=True, top_keywords=12)
+        )
+        print(f"   ✅ Extracted keywords for {len(df):,} records")
+        
+        # Step 3: GPT-5-nano categorization (parallel processing)
+        print("\n3️⃣ Categorizing with GPT-5-nano (parallel processing)...")
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+        import time
+        
+        # Initialize RCA_CATEGORY column
+        df[RCA_CATEGORY] = ""
+        
+        # Batch processing
+        batch_size = 1000
+        total_rows = len(df)
+        num_batches = (total_rows + batch_size - 1) // batch_size
+        
+        print(f"   Processing in {num_batches} batches of {batch_size} tickets...")
+        
+        def categorize_row_with_index(idx, row):
+            """Categorize a single row and return index and result"""
+            result = categorize_with_gpt4o_mini(
+                row[desc_column],
+                row[desc_column_full] if desc_column_full else None,
+                OPENAI_API_KEY,
+                OPENAI_DEPLOYMENT_NAME
+            )
+            return idx, result
+        
+        # Process batches
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = df.iloc[start_idx:end_idx].copy()
+            
+            print(f"\n   Batch {batch_num + 1}/{num_batches} (rows {start_idx + 1}-{end_idx})...")
+            batch_start_time = time.time()
+            
+            # Prepare tasks
+            tasks = [(idx, row) for idx, row in batch_df.iterrows()]
+            
+            # Process batch in parallel
+            results = {}
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(categorize_row_with_index, idx, row): idx 
+                    for idx, row in tasks
+                }
+                
+                with tqdm(total=len(tasks), desc=f"   Batch {batch_num + 1}", unit="ticket") as pbar:
+                    for future in as_completed(future_to_idx):
+                        try:
+                            idx, category = future.result()
+                            results[idx] = category
+                            pbar.update(1)
+                        except Exception as e:
+                            idx = future_to_idx[future]
+                            results[idx] = "Categorization Failed"
+                            pbar.update(1)
+            
+            # Update main dataframe
+            for idx, category in results.items():
+                df.loc[idx, RCA_CATEGORY] = category
+            
+            batch_time = time.time() - batch_start_time
+            batch_rate = len(tasks) / batch_time * 60 if batch_time > 0 else 0
+            print(f"   ✅ Batch completed in {batch_time:.1f}s ({batch_rate:.1f} tickets/min)")
+        
+        print(f"\n   ✅ GPT categorization completed for {len(df):,} records")
+        print(f"   📊 Unique categories: {df[RCA_CATEGORY].nunique():,}")
+        
+        # Step 4: Cluster categories with GPT (if requested)
+        if cluster_method in ['gpt', 'both']:
+            print("\n4️⃣ Clustering categories with GPT...")
+            df = cluster_categories_gpt_batch(
+                df, 
+                RCA_CATEGORY, 
+                OPENAI_API_KEY, 
+                OPENAI_DEPLOYMENT_NAME,
+                batch_size=50
+            )
+            print(f"   ✅ Clustered to {df[CLUSTER_GROUP].nunique():,} groups")
+        else:
+            # Create CLUSTER_GROUP column as copy of RCA_CATEGORY
+            df[CLUSTER_GROUP] = df[RCA_CATEGORY]
+        
+        return df
+    
+    def run(self, max_workers=50, cluster_method='gpt'):
+        """
+        Run the complete pipeline
+        
+        Args:
+            max_workers: Number of parallel workers for GPT (default: 50)
+            cluster_method: Clustering method ('gpt', 'rapidfuzz', or 'both')
+        
+        Returns:
+            Path to final categorized CSV file
+        """
+        print("=" * 80)
+        print("🚀 EXTRACT AND CATEGORIZE PIPELINE")
+        print("=" * 80)
+        print(f"📅 Date range: {self.extractor.start_date} to {self.extractor.end_date}")
+        print(f"🏢 Filter: DH- assignment groups")
+        print(f"🤖 GPT workers: {max_workers}")
+        print(f"🔗 Cluster method: {cluster_method}")
+        print("")
+        
+        # Step 1: Extract data
+        df = self.extract_data()
+        if df is None:
+            print("\n❌ Pipeline failed: Data extraction error")
+            return None
+        
+        # Step 2: Export to CSV (before categorization)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = self.export_to_csv(df, f"incidents_extracted_{timestamp}.csv")
+        if csv_path is None:
+            print("\n❌ Pipeline failed: CSV export error")
+            return None
+        
+        # Step 3: Categorize with GPT
+        df = self.categorize_with_gpt(df, max_workers=max_workers, cluster_method=cluster_method)
+        
+        # Step 4: Export categorized data to CSV
+        final_csv_path = self.export_to_csv(df, f"incidents_categorized_{timestamp}.csv")
+        
+        # Summary
+        print("\n" + "=" * 80)
+        print("✅ PIPELINE COMPLETED SUCCESSFULLY")
+        print("=" * 80)
+        print(f"📊 Total records processed: {len(df):,}")
+        print(f"📁 Extracted data: {csv_path}")
+        print(f"📁 Categorized data: {final_csv_path}")
+        
+        if RCA_CATEGORY in df.columns:
+            print(f"\n📈 Categorization Stats:")
+            print(f"   - Unique RCA categories: {df[RCA_CATEGORY].nunique():,}")
+            if CLUSTER_GROUP in df.columns:
+                print(f"   - Unique cluster groups: {df[CLUSTER_GROUP].nunique():,}")
+        
+        if 'crew' in df.columns:
+            print(f"\n👥 Crew breakdown:")
+            crew_counts = df['crew'].value_counts().head(5)
+            for crew, count in crew_counts.items():
+                print(f"   - {crew}: {count:,} records")
+        
+        return final_csv_path
+
+
+def main():
+    """Main function"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Extract and Categorize Pipeline')
+    parser.add_argument('--output-dir', type=str, default=None,
+                       help='Output directory for CSV files (default: Service_Catalog/output)')
+    parser.add_argument('--max-workers', type=int, default=50,
+                       help='Number of parallel workers for GPT (default: 50)')
+    parser.add_argument('--cluster-method', type=str, default='gpt',
+                       choices=['gpt', 'rapidfuzz', 'both'],
+                       help='Clustering method (default: gpt)')
+    
+    args = parser.parse_args()
+    
+    # Initialize and run pipeline
+    pipeline = ExtractAndCategorize(output_dir=args.output_dir)
+    result = pipeline.run(max_workers=args.max_workers, cluster_method=args.cluster_method)
+    
+    if result:
+        print(f"\n✅ Success! Categorized data saved to: {result}")
+    else:
+        print("\n❌ Pipeline failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
