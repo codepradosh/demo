@@ -149,17 +149,27 @@ class ExtractAndCategorize:
             # 1. Drop empty/NaN incident numbers
             df_combined = df_combined.dropna(subset=['incident_number'])
             
+            # 1.5 NEW RULE: Drop if 'opened_at' is empty
+            if 'opened_at' in df_combined.columns:
+                pre_open_filter = len(df_combined)
+                # Drop NaN or empty string in opened_at
+                df_combined = df_combined[df_combined['opened_at'].notna() & (df_combined['opened_at'].astype(str).str.strip() != '')]
+                dropped_opened = pre_open_filter - len(df_combined)
+                if dropped_opened > 0:
+                    print(f"      - Dropped {dropped_opened:,} records with empty 'opened_at'")
+            
             # 2. Keep only rows starting with 'INC' (Strict Uppercase per user confirmation)
             # Regex: ^INC.* matches any string starting with INC
             valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
             
             # Debug: what are we dropping?
             dropped_rows = df_combined[~valid_mask]
+            
             if not dropped_rows.empty:
-                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS!")
+                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS (Regex Mismatch)!")
                 print(f"      - Examples: {dropped_rows['incident_number'].head(5).tolist()}")
             else:
-                print(f"      - No invalid records found during validation check.")
+                print(f"      - No invalid records found during regex check.")
             
             df_combined = df_combined[valid_mask]
             
@@ -227,7 +237,17 @@ class ExtractAndCategorize:
         if df is not None and 'incident_number' in df.columns:
             # Strict filtering one last time
             original_len = len(df)
-            mask = df['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
+            
+            # Check for INC match
+            mask_inc = df['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
+            
+            # Check for opened_at presence (if column exists)
+            if 'opened_at' in df.columns:
+                mask_date = df['opened_at'].notna() & (df['opened_at'].astype(str).str.strip() != '')
+                mask = mask_inc & mask_date
+            else:
+                mask = mask_inc
+                
             df_clean = df[mask]
             
             if len(df_clean) < original_len:
