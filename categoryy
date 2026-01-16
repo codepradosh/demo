@@ -33,11 +33,11 @@ sys.path.insert(0, str(DATA_EXTRACTION_DIR))
 # Try both import paths to support different folder structures
 try:
     # Local structure: data_extraction/initial_load_incidents.py
-    from data_extraction.initial_load_incidents import InitialLoadIncidents
+    from data_extraction.initial_load_incident import InitialLoadIncidents
 except ImportError:
     try:
         # AWS structure: all files in data_extraction folder
-        from initial_load_incidents import InitialLoadIncidents
+        from initial_load_incident import InitialLoadIncidents
     except ImportError as e:
         print(f"Error: Could not import InitialLoadIncidents: {e}")
         raise
@@ -138,6 +138,9 @@ class ExtractAndCategorize:
         # Map and combine
         df_combined = self.extractor.map_and_combine(df_atlas, df_gsnow)
         
+        # DEBUG: Print columns
+        print(f"\n   🔍 Columns in combined dataframe: {df_combined.columns.tolist()}")
+        
         # CLEANING: Filter invalid incident numbers
         if 'incident_number' in df_combined.columns:
             initial_count = len(df_combined)
@@ -146,14 +149,17 @@ class ExtractAndCategorize:
             # 1. Drop empty/NaN incident numbers
             df_combined = df_combined.dropna(subset=['incident_number'])
             
-            # 2. Keep only rows starting with 'INC' (case-insensitive, strip whitespace)
+            # 2. Keep only rows starting with 'INC' (Strict Uppercase per user confirmation)
             # Regex: ^INC.* matches any string starting with INC
-            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC', case=False, na=False)
+            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
             
             # Debug: what are we dropping?
             dropped_rows = df_combined[~valid_mask]
             if not dropped_rows.empty:
-                print(f"      - Examples of invalid IDs to be dropped: {dropped_rows['incident_number'].head(5).tolist()}")
+                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS!")
+                print(f"      - Examples: {dropped_rows['incident_number'].head(5).tolist()}")
+            else:
+                print(f"      - No invalid records found during validation check.")
             
             df_combined = df_combined[valid_mask]
             
@@ -162,8 +168,12 @@ class ExtractAndCategorize:
             if dropped > 0:
                 print(f"      - Dropped {dropped:,} invalid records (missing or not starting with INC)")
             print(f"   ✅ Data validation passed. Count: {final_count:,}")
+            
+            # Save intermediate debug file
+            # df_combined.to_csv("debug_cleaned_data.csv", index=False)
+            # print("   (Saved debug_cleaned_data.csv)")
         else:
-            print("⚠️ Warning: 'incident_number' column not found, skipping validation")
+            print(f"⚠️ Warning: 'incident_number' column not found! Available columns: {df_combined.columns.tolist()}")
         
         if df_combined is None:
             print("❌ Failed to combine data")
@@ -211,14 +221,25 @@ class ExtractAndCategorize:
             filename = f"incidents_{timestamp}.csv"
         
         csv_path = self.output_dir / filename
+        output_path = self.output_dir / filename
+        
+        # FINAL SAFETY CHECK: Ensure no garbage IDs in output
+        if df is not None and 'incident_number' in df.columns:
+            # Strict filtering one last time
+            original_len = len(df)
+            mask = df['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
+            df_clean = df[mask]
+            
+            if len(df_clean) < original_len:
+                print(f"⚠️ SAFETY CHECK: Removed {original_len - len(df_clean)} invalid records right before save!")
+                df = df_clean
         
         try:
-            # Export to CSV
-            df.to_csv(csv_path, index=False, encoding='utf-8')
-            print(f"✅ Exported {len(df):,} records to: {csv_path}")
+            df.to_csv(output_path, index=False, encoding='utf-8')
+            print(f"✅ Exported {len(df):,} records to: {output_path}")
             print(f"   Columns: {len(df.columns)}")
-            print(f"   File size: {csv_path.stat().st_size / 1024 / 1024:.2f} MB")
-            return csv_path
+            print(f"   File size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+            return output_path
         except Exception as e:
             print(f"❌ Error exporting to CSV: {e}")
             traceback.print_exc()
