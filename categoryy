@@ -350,9 +350,17 @@ class ExtractAndCategorize:
                 batch_size=50
             )
             print(f"   ✅ Clustered to {df[CLUSTER_GROUP].nunique():,} groups")
+            
+            # Generate Logical Group Name from clustered results
+            df['Logical Group Name'] = df[CLUSTER_GROUP].fillna(df[RCA_CATEGORY])
         else:
             # Create CLUSTER_GROUP column as copy of RCA_CATEGORY
             df[CLUSTER_GROUP] = df[RCA_CATEGORY]
+            
+            # Logical Group Name = RCA Category when no clustering
+            df['Logical Group Name'] = df[RCA_CATEGORY]
+        
+        print(f"\n5️⃣ Generated logical group names: {df['Logical Group Name'].nunique():,} unique groups")
         
         return df
     
