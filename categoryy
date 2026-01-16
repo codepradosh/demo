@@ -146,8 +146,15 @@ class ExtractAndCategorize:
             # 1. Drop empty/NaN incident numbers
             df_combined = df_combined.dropna(subset=['incident_number'])
             
-            # 2. Keep only rows starting with 'INC'
-            valid_mask = df_combined['incident_number'].astype(str).str.startswith('INC')
+            # 2. Keep only rows starting with 'INC' (case-insensitive, strip whitespace)
+            # Regex: ^INC.* matches any string starting with INC
+            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC', case=False, na=False)
+            
+            # Debug: what are we dropping?
+            dropped_rows = df_combined[~valid_mask]
+            if not dropped_rows.empty:
+                print(f"      - Examples of invalid IDs to be dropped: {dropped_rows['incident_number'].head(5).tolist()}")
+            
             df_combined = df_combined[valid_mask]
             
             final_count = len(df_combined)
