@@ -160,18 +160,18 @@ class ExtractAndCategorize:
                 else:
                     print(f"      - All records have valid 'opened_at' values")
             
-            # 2. Keep only rows starting with 'INC' (Strict Uppercase per user confirmation)
-            # Regex: ^INC.* matches any string starting with INC
-            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
+            # 2. Keep only rows starting with 'INC1' or 'INC2' (Strict pattern)
+            # Regex: ^INC[12] matches INC1... or INC2...
+            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC[12]', case=True, na=False)
             
             # Debug: what are we dropping?
             dropped_rows = df_combined[~valid_mask]
             
             if not dropped_rows.empty:
-                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS (Regex Mismatch)!")
+                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS (Not INC1/INC2)!")
                 print(f"      - Examples: {dropped_rows['incident_number'].head(5).tolist()}")
             else:
-                print(f"      - No invalid records found during regex check.")
+                print(f"      - No invalid records found during INC1/INC2 check.")
             
             df_combined = df_combined[valid_mask]
             
@@ -240,8 +240,8 @@ class ExtractAndCategorize:
             # Strict filtering one last time
             original_len = len(df)
             
-            # Check for INC match
-            mask_inc = df['incident_number'].astype(str).str.strip().str.match(r'^INC', case=True, na=False)
+            # Check for INC1 or INC2 match
+            mask_inc = df['incident_number'].astype(str).str.strip().str.match(r'^INC[12]', case=True, na=False)
             
             # Check for opened_at presence (if column exists)
             if 'opened_at' in df.columns:
