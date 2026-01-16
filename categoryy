@@ -269,6 +269,41 @@ class ExtractAndCategorize:
         )
         print(f"   ✅ Extracted keywords for {len(df):,} records")
         
+        # Step 2.5: Apply rule-based categorization for specific KPCI patterns
+        print("\n2️⃣.5 Applying rule-based KPCI categorization...")
+        
+        # Initialize RCA_CATEGORY and CLUSTER_GROUP columns for rule-based matches
+        df[RCA_CATEGORY] = None
+        df[CLUSTER_GROUP] = None
+        
+        # Rule 1: KPCI SourcesNotSent pattern
+        # Pattern: "KPCI SourcesNotSent" or "kpci sourcesnotsent" (case-insensitive)
+        pattern1 = df[CLEANED_DESCRIPTION].str.contains(
+            r'kpci\s+sourcesnotsent', 
+            case=False, 
+            na=False, 
+            regex=True
+        )
+        df.loc[pattern1, RCA_CATEGORY] = "KPCI Source Not Sent"
+        df.loc[pattern1, CLUSTER_GROUP] = "KPCI Source Not Sent"
+        
+        # Rule 2: KPCI PhoneHomeAgent pattern
+        # Pattern: "PhoneHomeAgent" or "Phone Home" with "KPCI" (case-insensitive)
+        pattern2 = df[CLEANED_DESCRIPTION].str.contains(
+            r'(phonehomeagent|phone\s+home).*kpci|kpci.*(phonehomeagent|phone\s+home)', 
+            case=False, 
+            na=False, 
+            regex=True
+        )
+        df.loc[pattern2, RCA_CATEGORY] = "KPCI Phone Home Failed"
+        df.loc[pattern2, CLUSTER_GROUP] = "KPCI Phone Home Failed"
+        
+        rule_based_count = df[RCA_CATEGORY].notna().sum()
+        print(f"   ✅ Applied rule-based categorization to {rule_based_count:,} records")
+        if rule_based_count > 0:
+            print(f"      - KPCI Source Not Sent: {(df[RCA_CATEGORY] == 'KPCI Source Not Sent').sum():,}")
+            print(f"      - KPCI Phone Home Failed: {(df[RCA_CATEGORY] == 'KPCI Phone Home Failed').sum():,}")
+        
         # Step 3: GPT-5-nano categorization (parallel processing)
         print("\n3️⃣ Categorizing with GPT-5-nano (parallel processing)...")
         
@@ -276,8 +311,19 @@ class ExtractAndCategorize:
         from threading import Lock
         import time
         
-        # Initialize RCA_CATEGORY column
-        df[RCA_CATEGORY] = ""
+        # Initialize RCA_CATEGORY column if not already present, but preserve existing values
+        if RCA_CATEGORY not in df.columns:
+            df[RCA_CATEGORY] = ""
+        else:
+            # Provide default for completely missing/NaN values only
+             df[RCA_CATEGORY] = df[RCA_CATEGORY].fillna("")
+        
+        # Identify rows that need GPT categorization (empty RCA_CATEGORY)
+        # We only process rows where RCA_CATEGORY is empty/blank
+        rows_to_process = df[df[RCA_CATEGORY] == ""].index
+        print(f"   ℹ️ Skipping {len(df) - len(rows_to_process):,} already categorized records")
+        print(f"   ℹ️ Sending {len(rows_to_process):,} records to GPT")
+
         
         # Batch processing
         batch_size = 1000
@@ -305,8 +351,15 @@ class ExtractAndCategorize:
             print(f"\n   Batch {batch_num + 1}/{num_batches} (rows {start_idx + 1}-{end_idx})...")
             batch_start_time = time.time()
             
-            # Prepare tasks
-            tasks = [(idx, row) for idx, row in batch_df.iterrows()]
+            # Prepare tasks (filter out already categorized rows)
+            tasks = [
+                (idx, row) for idx, row in batch_df.iterrows() 
+                if str(row[RCA_CATEGORY]) == ""
+            ]
+            
+            if not tasks:
+                print(f"   ℹ️ Batch {batch_num + 1}: All records already categorized. Skipping.")
+                continue
             
             # Process batch in parallel
             results = {}
@@ -351,16 +404,21 @@ class ExtractAndCategorize:
             )
             print(f"   ✅ Clustered to {df[CLUSTER_GROUP].nunique():,} groups")
             
-            # Generate Logical Group Name from clustered results
-            df['Logical Group Name'] = df[CLUSTER_GROUP].fillna(df[RCA_CATEGORY])
+            # CRITICAL: Restore the rule-based KPCI CLUSTER_GROUP values
+            # (In case GPT clustering overwrote them with something generic)
+            
+            # Restore Rule 1: KPCI SourcesNotSent
+            mask1 = df[RCA_CATEGORY] == "KPCI Source Not Sent"
+            df.loc[mask1, CLUSTER_GROUP] = "KPCI Source Not Sent"
+            
+            # Restore Rule 2: KPCI PhoneHomeAgent
+            mask2 = df[RCA_CATEGORY] == "KPCI Phone Home Failed"
+            df.loc[mask2, CLUSTER_GROUP] = "KPCI Phone Home Failed"
+            
+            print(f"   ✅ Restored rule-based cluster groups (count: {(mask1.sum() + mask2.sum()):,})")
         else:
             # Create CLUSTER_GROUP column as copy of RCA_CATEGORY
             df[CLUSTER_GROUP] = df[RCA_CATEGORY]
-            
-            # Logical Group Name = RCA Category when no clustering
-            df['Logical Group Name'] = df[RCA_CATEGORY]
-        
-        print(f"\n5️⃣ Generated logical group names: {df['Logical Group Name'].nunique():,} unique groups")
         
         return df
     
