@@ -160,9 +160,14 @@ class ExtractAndCategorize:
                 else:
                     print(f"      - All records have valid 'opened_at' values")
             
-            # 2. Keep only rows starting with 'INC1' or 'INC2' (Strict pattern)
-            # Regex: ^INC[12] matches INC1... or INC2...
-            valid_mask = df_combined['incident_number'].astype(str).str.strip().str.match(r'^INC[12]', case=True, na=False)
+            # 2. Keep only rows starting with 'INC1' or 'INC2' (Simple Python check)
+            def is_valid_incident(val):
+                if pd.isna(val):
+                    return False
+                s = str(val).strip()
+                return s.startswith('INC1') or s.startswith('INC2')
+            
+            valid_mask = df_combined['incident_number'].apply(is_valid_incident)
             
             # Debug: what are we dropping?
             dropped_rows = df_combined[~valid_mask]
@@ -173,7 +178,7 @@ class ExtractAndCategorize:
             else:
                 print(f"      - No invalid records found during INC1/INC2 check.")
             
-            df_combined = df_combined[valid_mask]
+            df_combined = df_combined[valid_mask].copy()
             
             final_count = len(df_combined)
             dropped = initial_count - final_count
@@ -245,25 +250,36 @@ class ExtractAndCategorize:
         output_path = self.output_dir / filename
         
         # FINAL SAFETY CHECK: Ensure no garbage IDs in output
+        # Using simple Python check to guarantee it works
         if df is not None and 'incident_number' in df.columns:
-            # Strict filtering one last time
             original_len = len(df)
             
-            # Check for INC1 or INC2 match
-            mask_inc = df['incident_number'].astype(str).str.strip().str.match(r'^INC[12]', case=True, na=False)
+            # Simple Python filter - check each row's incident_number
+            def is_valid_incident(val):
+                if pd.isna(val):
+                    return False
+                s = str(val).strip()
+                return s.startswith('INC1') or s.startswith('INC2')
             
-            # Check for opened_at presence (if column exists)
-            if 'opened_at' in df.columns:
-                mask_date = ~pd.isna(df['opened_at'])
-                mask = mask_inc & mask_date
-            else:
-                mask = mask_inc
-                
-            df_clean = df[mask]
+            # Apply filter
+            valid_rows = df['incident_number'].apply(is_valid_incident)
+            df_clean = df[valid_rows].copy()
             
-            if len(df_clean) < original_len:
-                print(f"⚠️ SAFETY CHECK: Removed {original_len - len(df_clean)} invalid records right before save!")
+            # Also remove rows with empty opened_at
+            if 'opened_at' in df_clean.columns:
+                df_clean = df_clean[~pd.isna(df_clean['opened_at'])].copy()
+            
+            removed = original_len - len(df_clean)
+            if removed > 0:
+                print(f"⚠️ SAFETY CHECK: Removed {removed} invalid records right before save!")
+                # Show examples of what was removed
+                invalid_df = df[~valid_rows]
+                if len(invalid_df) > 0:
+                    print(f"   Examples removed: {invalid_df['incident_number'].head(5).tolist()}")
                 df = df_clean
+            
+            # Final verification
+            print(f"   ✅ Final record count: {len(df):,}")
         
         try:
             df.to_csv(output_path, index=False, encoding='utf-8')
