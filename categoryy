@@ -178,8 +178,17 @@ class ExtractAndCategorize:
             final_count = len(df_combined)
             dropped = initial_count - final_count
             if dropped > 0:
-                print(f"      - Dropped {dropped:,} invalid records (missing or not starting with INC)")
+                print(f"      - Dropped {dropped:,} invalid records (missing or not starting with INC1/INC2)")
             print(f"   ✅ Data validation passed. Count: {final_count:,}")
+            
+            # DEBUG: Print first 10 incident numbers to verify
+            print(f"\n   🔍 DEBUG - First 10 incident_number values after validation:")
+            print(f"      {df_combined['incident_number'].head(10).tolist()}")
+            
+            # DEBUG: Save intermediate file to check
+            debug_path = self.output_dir / "DEBUG_after_validation.csv"
+            df_combined[['incident_number', 'opened_at']].head(100).to_csv(debug_path, index=False)
+            print(f"   📝 DEBUG file saved: {debug_path}")
             
             # Save intermediate debug file
             # df_combined.to_csv("debug_cleaned_data.csv", index=False)
