@@ -149,14 +149,16 @@ class ExtractAndCategorize:
             # 1. Drop empty/NaN incident numbers
             df_combined = df_combined.dropna(subset=['incident_number'])
             
-            # 1.5 NEW RULE: Drop if 'opened_at' is empty
+            # 1.5 NEW RULE: Drop if 'opened_at' is empty/invalid (datetime column)
             if 'opened_at' in df_combined.columns:
                 pre_open_filter = len(df_combined)
-                # Drop NaN or empty string in opened_at
-                df_combined = df_combined[df_combined['opened_at'].notna() & (df_combined['opened_at'].astype(str).str.strip() != '')]
+                # For datetime columns, use pd.isna() which catches NaT (Not a Time)
+                df_combined = df_combined[~pd.isna(df_combined['opened_at'])]
                 dropped_opened = pre_open_filter - len(df_combined)
                 if dropped_opened > 0:
-                    print(f"      - Dropped {dropped_opened:,} records with empty 'opened_at'")
+                    print(f"      - Dropped {dropped_opened:,} records with empty/invalid 'opened_at'")
+                else:
+                    print(f"      - All records have valid 'opened_at' values")
             
             # 2. Keep only rows starting with 'INC' (Strict Uppercase per user confirmation)
             # Regex: ^INC.* matches any string starting with INC
@@ -243,7 +245,7 @@ class ExtractAndCategorize:
             
             # Check for opened_at presence (if column exists)
             if 'opened_at' in df.columns:
-                mask_date = df['opened_at'].notna() & (df['opened_at'].astype(str).str.strip() != '')
+                mask_date = ~pd.isna(df['opened_at'])
                 mask = mask_inc & mask_date
             else:
                 mask = mask_inc
