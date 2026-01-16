@@ -153,12 +153,30 @@ class ExtractAndCategorize:
             if 'opened_at' in df_combined.columns:
                 pre_open_filter = len(df_combined)
                 # For datetime columns, use pd.isna() which catches NaT (Not a Time)
-                df_combined = df_combined[~pd.isna(df_combined['opened_at'])]
+                df_combined = df_combined[~pd.isna(df_combined['opened_at'])].copy()
                 dropped_opened = pre_open_filter - len(df_combined)
                 if dropped_opened > 0:
                     print(f"      - Dropped {dropped_opened:,} records with empty/invalid 'opened_at'")
                 else:
                     print(f"      - All records have valid 'opened_at' values")
+            
+            # 1.6 NEW RULE: Drop if 'short_description' is empty/missing
+            desc_col = None
+            if 'short_description' in df_combined.columns:
+                desc_col = 'short_description'
+            elif 'Short_Description' in df_combined.columns:
+                desc_col = 'Short_Description'
+            
+            if desc_col:
+                pre_desc_filter = len(df_combined)
+                # Remove rows where short_description is NaN or empty string
+                df_combined = df_combined[
+                    df_combined[desc_col].notna() & 
+                    (df_combined[desc_col].astype(str).str.strip() != '')
+                ].copy()
+                dropped_desc = pre_desc_filter - len(df_combined)
+                if dropped_desc > 0:
+                    print(f"      - Dropped {dropped_desc:,} records with empty 'short_description'")
             
             # 2. Keep only rows starting with 'INC1' or 'INC2' (Simple Python check)
             def is_valid_incident(val):
@@ -268,6 +286,14 @@ class ExtractAndCategorize:
             # Also remove rows with empty opened_at
             if 'opened_at' in df_clean.columns:
                 df_clean = df_clean[~pd.isna(df_clean['opened_at'])].copy()
+            
+            # Also remove rows with empty short_description
+            desc_col = 'short_description' if 'short_description' in df_clean.columns else 'Short_Description' if 'Short_Description' in df_clean.columns else None
+            if desc_col and desc_col in df_clean.columns:
+                df_clean = df_clean[
+                    df_clean[desc_col].notna() & 
+                    (df_clean[desc_col].astype(str).str.strip() != '')
+                ].copy()
             
             removed = original_len - len(df_clean)
             if removed > 0:
