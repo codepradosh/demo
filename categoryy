@@ -1,115 +1,66 @@
 #!/usr/bin/env python3
 """
-COMPREHENSIVE CSV Cleaner
-Removes:
-1. Rows where Cluster Group is blank (but incident_number is valid INC)
-2. Garbage rows (ARCHIVELOG, CreateOraObject, etc)
+Debug script - shows raw file contents
 """
 
-import pandas as pd
 import sys
 
-if len(sys.argv) < 3:
-    print("Usage: python clean_all.py input.csv output.csv")
+if len(sys.argv) < 2:
+    print("Usage: python debug_file.py input.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
-output_file = sys.argv[2]
 
 print("=" * 70)
-print("🧹 COMPREHENSIVE CSV CLEANER")
+print("🔍 DEBUG: RAW FILE ANALYSIS")
 print("=" * 70)
-print(f"Input:  {input_file}")
-print(f"Output: {output_file}")
+print(f"File: {input_file}")
 
-# Read CSV
-print("\n📖 Loading CSV...")
-df = pd.read_csv(input_file, low_memory=False)
-initial_rows = len(df)
-print(f"   Loaded {initial_rows:,} rows")
+# Read as raw text
+with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
 
-# Find columns
-cluster_col = None
-for col in df.columns:
-    if 'cluster' in col.lower():
-        cluster_col = col
-        break
+total_lines = len(lines)
+print(f"\nTotal lines in file: {total_lines:,}")
 
-print(f"\n🔍 Cluster Group column: {cluster_col}")
-
-# === STEP 1: Remove rows with blank Cluster Group ===
+# Show LAST 50 lines (where garbage usually is)
 print("\n" + "=" * 50)
-print("STEP 1: Remove BLANK Cluster Group rows")
+print("LAST 50 LINES OF FILE:")
 print("=" * 50)
+for i, line in enumerate(lines[-50:], start=total_lines-50):
+    # Get first field (incident_number)
+    first_field = line.split(',')[0][:60]
+    print(f"Line {i}: '{first_field}'")
 
-if cluster_col:
-    # Identify blanks (NaN, empty string, 'nan' string)
-    blank_mask = (
-        df[cluster_col].isna() | 
-        (df[cluster_col].astype(str).str.strip() == '') |
-        (df[cluster_col].astype(str).str.lower() == 'nan')
-    )
-    blank_count = blank_mask.sum()
-    print(f"   Found {blank_count:,} rows with blank Cluster Group")
-    
-    if blank_count > 0:
-        blank_df = df[blank_mask]
-        print("\n   Sample INC numbers with blank Cluster Group:")
-        for idx in blank_df.head(10).index:
-            inc = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
-            print(f"      {inc}")
-    
-    df = df[~blank_mask].copy()
-    print(f"\n   ✅ Removed {blank_count:,} blank rows")
-    print(f"   Remaining: {len(df):,} rows")
-
-# === STEP 2: Remove garbage rows (non-INC incident_number) ===
+# Count lines NOT starting with INC (excluding header)
 print("\n" + "=" * 50)
-print("STEP 2: Remove GARBAGE rows (invalid incident_number)")
+print("LINES NOT STARTING WITH 'INC':")
 print("=" * 50)
+non_inc_count = 0
+non_inc_examples = []
+for i, line in enumerate(lines[1:], start=1):  # Skip header
+    first_field = line.split(',')[0].strip()
+    if not first_field.startswith('INC'):
+        non_inc_count += 1
+        if len(non_inc_examples) < 30:
+            non_inc_examples.append(f"Line {i}: '{first_field[:50]}'")
 
-if 'incident_number' in df.columns:
-    # Valid = starts with INC
-    def is_valid_inc(val):
-        if pd.isna(val):
-            return False
-        return str(val).strip().startswith('INC')
-    
-    valid_mask = df['incident_number'].apply(is_valid_inc)
-    garbage_count = (~valid_mask).sum()
-    print(f"   Found {garbage_count:,} garbage rows (not starting with INC)")
-    
-    if garbage_count > 0:
-        garbage_df = df[~valid_mask]
-        print("\n   Sample garbage incident_numbers:")
-        for idx in garbage_df.head(15).index:
-            inc = df.loc[idx, 'incident_number']
-            print(f"      '{str(inc)[:60]}'")
-    
-    df = df[valid_mask].copy()
-    print(f"\n   ✅ Removed {garbage_count:,} garbage rows")
-    print(f"   Remaining: {len(df):,} rows")
+print(f"Count: {non_inc_count}")
+if non_inc_examples:
+    print("\nExamples:")
+    for ex in non_inc_examples:
+        print(f"   {ex}")
 
-# === FINAL SUMMARY ===
-final_rows = len(df)
-total_removed = initial_rows - final_rows
-
-# Verify no blanks remain
+# Also check for blank first fields
 print("\n" + "=" * 50)
-print("VERIFICATION")
+print("LINES WITH BLANK/EMPTY FIRST FIELD:")
 print("=" * 50)
-if cluster_col:
-    remaining_blanks = df[cluster_col].isna().sum() + (df[cluster_col].astype(str).str.strip() == '').sum()
-    print(f"   Remaining blank Cluster Groups: {remaining_blanks}")
+blank_count = 0
+for i, line in enumerate(lines[1:], start=1):
+    first_field = line.split(',')[0].strip()
+    if first_field == '' or first_field.lower() == 'nan':
+        blank_count += 1
+        if blank_count <= 10:
+            print(f"   Line {i}: entire line = '{line[:100]}'")
 
-# Save
-print(f"\n💾 Saving to {output_file}...")
-df.to_csv(output_file, index=False, encoding='utf-8')
-
-print("\n" + "=" * 70)
-print("📊 FINAL SUMMARY")
-print("=" * 70)
-print(f"   Original rows:  {initial_rows:,}")
-print(f"   Total removed:  {total_removed:,}")
-print(f"   Final rows:     {final_rows:,}")
-print("\n✅ DONE! Open the cleaned file in Excel for your pivot table.")
+print(f"\nTotal blank first fields: {blank_count}")
