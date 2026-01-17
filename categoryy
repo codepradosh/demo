@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CSV Cleaner - Removes rows where cleaned_description is empty
+CSV Cleaner - Removes rows where Cluster Group OR RCA Category is empty
 """
 
 import pandas as pd
@@ -14,56 +14,71 @@ input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🧹 CSV CLEANER (cleaned_description validation)")
+print("🧹 CSV CLEANER (Remove Blank Cluster Group / RCA Category)")
 print("=" * 60)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
 
-# Read CSV with pandas
-print("\n📖 Loading CSV with pandas...")
+# Read CSV
+print("\n📖 Loading CSV...")
 df = pd.read_csv(input_file, low_memory=False)
 initial_rows = len(df)
-print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
+print(f"   Loaded {initial_rows:,} rows")
 
-# Check if cleaned_description column exists
-if 'cleaned_description' not in df.columns:
-    print("❌ ERROR: 'cleaned_description' column not found!")
-    print(f"   Available columns: {df.columns.tolist()[:10]}...")
-    sys.exit(1)
+# Find columns (handle different naming)
+cluster_col = None
+rca_col = None
 
-print(f"\n🔍 Checking 'cleaned_description' column...")
+for col in df.columns:
+    if 'cluster' in col.lower() and 'group' in col.lower():
+        cluster_col = col
+    if 'rca' in col.lower() and 'category' in col.lower():
+        rca_col = col
 
-# Show sample values
-print("\n   First 5 cleaned_description values:")
-for idx, val in df['cleaned_description'].head(5).items():
-    is_empty = pd.isna(val) or str(val).strip() == ''
-    status = "❌ EMPTY" if is_empty else "✅ OK"
-    print(f"      Row {idx}: '{str(val)[:40]}...' {status}")
+print(f"\n🔍 Found columns:")
+print(f"   Cluster Group: {cluster_col}")
+print(f"   RCA Category: {rca_col}")
 
-# Filter: Keep only rows where cleaned_description is NOT empty
+# Count blanks before filtering
+blank_cluster = 0
+blank_rca = 0
+
+if cluster_col:
+    blank_cluster = df[cluster_col].isna().sum() + (df[cluster_col].astype(str).str.strip() == '').sum()
+    print(f"\n   Blank Cluster Group: {blank_cluster:,}")
+
+if rca_col:
+    blank_rca = df[rca_col].isna().sum() + (df[rca_col].astype(str).str.strip() == '').sum()
+    print(f"   Blank RCA Category: {blank_rca:,}")
+
+# Filter: Keep only rows where BOTH Cluster Group AND RCA Category are NOT empty
 print(f"\n🔍 Filtering rows...")
 
-# Create mask for valid rows (not NaN and not empty string)
-valid_mask = df['cleaned_description'].notna() & (df['cleaned_description'].astype(str).str.strip() != '')
-df_clean = df[valid_mask].copy()
+valid_mask = pd.Series([True] * len(df))
 
+if cluster_col:
+    valid_mask &= df[cluster_col].notna() & (df[cluster_col].astype(str).str.strip() != '')
+
+if rca_col:
+    valid_mask &= df[rca_col].notna() & (df[rca_col].astype(str).str.strip() != '')
+
+df_clean = df[valid_mask].copy()
 invalid_count = initial_rows - len(df_clean)
 
+print(f"\n❌ Removed {invalid_count:,} rows with blank values")
+
+# Show examples
 if invalid_count > 0:
-    print(f"\n❌ Found {invalid_count:,} rows with EMPTY cleaned_description")
-    
-    # Show examples with incident_number
     invalid_df = df[~valid_mask]
-    print("\n   Examples of incident_number values being removed:")
-    for idx in invalid_df.head(20).index:
+    print("\n   Examples of removed rows (incident_number):")
+    for idx in invalid_df.head(15).index:
         inc_num = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
-        print(f"      Row {idx}: '{str(inc_num)[:60]}'")
-else:
-    print(f"\n✅ All rows have valid cleaned_description values")
+        cg = df.loc[idx, cluster_col] if cluster_col else 'N/A'
+        print(f"      Row {idx}: inc='{str(inc_num)[:40]}', cluster='{str(cg)[:20]}'")
 
 print(f"\n✅ Valid rows: {len(df_clean):,}")
 
-# Save cleaned CSV
+# Save
 print(f"\n💾 Saving to {output_file}...")
 df_clean.to_csv(output_file, index=False, encoding='utf-8')
 
@@ -71,6 +86,6 @@ print("\n" + "=" * 60)
 print("📊 SUMMARY")
 print("=" * 60)
 print(f"   Original rows:  {initial_rows:,}")
-print(f"   Invalid removed: {invalid_count:,}")
+print(f"   Removed:        {invalid_count:,}")
 print(f"   Final rows:     {len(df_clean):,}")
 print("✅ DONE!")
