@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-CSV Cleaner - Removes rows where Cluster Group OR RCA Category is empty
+Pivot Table Analysis and Cleaning
+Creates pivot summary, identifies blanks, and removes them
 """
 
 import pandas as pd
 import sys
 
 if len(sys.argv) < 3:
-    print("Usage: python clean_csv_final.py input.csv output.csv")
+    print("Usage: python pivot_clean.py input.csv output.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
-print("=" * 60)
-print("🧹 CSV CLEANER (Remove Blank Cluster Group / RCA Category)")
-print("=" * 60)
+print("=" * 70)
+print("📊 PIVOT TABLE ANALYSIS & CLEANING")
+print("=" * 70)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
 
@@ -25,67 +26,102 @@ df = pd.read_csv(input_file, low_memory=False)
 initial_rows = len(df)
 print(f"   Loaded {initial_rows:,} rows")
 
-# Find columns (handle different naming)
+# Find the Cluster Group column
 cluster_col = None
 rca_col = None
-
 for col in df.columns:
-    if 'cluster' in col.lower() and 'group' in col.lower():
+    if 'cluster' in col.lower():
         cluster_col = col
     if 'rca' in col.lower() and 'category' in col.lower():
         rca_col = col
 
-print(f"\n🔍 Found columns:")
+print(f"\n🔍 Columns found:")
 print(f"   Cluster Group: {cluster_col}")
 print(f"   RCA Category: {rca_col}")
 
-# Count blanks before filtering
-blank_cluster = 0
-blank_rca = 0
+# Create pivot table summary (like Excel)
+print("\n📊 PIVOT TABLE SUMMARY (Top 20 + Blanks):")
+print("-" * 50)
 
 if cluster_col:
-    blank_cluster = df[cluster_col].isna().sum() + (df[cluster_col].astype(str).str.strip() == '').sum()
-    print(f"\n   Blank Cluster Group: {blank_cluster:,}")
+    # Replace NaN and empty strings with "(blank)" for counting
+    df['_cluster_display'] = df[cluster_col].fillna('(blank)')
+    df.loc[df['_cluster_display'].astype(str).str.strip() == '', '_cluster_display'] = '(blank)'
+    
+    pivot = df.groupby('_cluster_display').size().sort_values(ascending=False)
+    
+    # Show top 20
+    for val, count in pivot.head(20).items():
+        print(f"   {str(val)[:40]}: {count:,}")
+    
+    # Always show blanks at end
+    if '(blank)' in pivot.index:
+        blank_count = pivot['(blank)']
+        print(f"\n   ⚠️ (blank): {blank_count:,}  <-- THESE WILL BE REMOVED")
+    
+    print(f"\n   Total categories: {len(pivot)}")
 
-if rca_col:
-    blank_rca = df[rca_col].isna().sum() + (df[rca_col].astype(str).str.strip() == '').sum()
-    print(f"   Blank RCA Category: {blank_rca:,}")
+# Identify blank rows
+print("\n🔍 Identifying blank rows...")
 
-# Filter: Keep only rows where BOTH Cluster Group AND RCA Category are NOT empty
-print(f"\n🔍 Filtering rows...")
-
-valid_mask = pd.Series([True] * len(df))
+# Create comprehensive blank check
+blank_mask = pd.Series([False] * len(df))
 
 if cluster_col:
-    valid_mask &= df[cluster_col].notna() & (df[cluster_col].astype(str).str.strip() != '')
+    is_blank_cluster = df[cluster_col].isna() | (df[cluster_col].astype(str).str.strip() == '') | (df[cluster_col].astype(str).str.lower() == 'nan')
+    blank_mask |= is_blank_cluster
+    print(f"   Blank Cluster Group: {is_blank_cluster.sum():,}")
 
 if rca_col:
-    valid_mask &= df[rca_col].notna() & (df[rca_col].astype(str).str.strip() != '')
+    is_blank_rca = df[rca_col].isna() | (df[rca_col].astype(str).str.strip() == '') | (df[rca_col].astype(str).str.lower() == 'nan')
+    blank_mask |= is_blank_rca
+    print(f"   Blank RCA Category: {is_blank_rca.sum():,}")
 
-df_clean = df[valid_mask].copy()
-invalid_count = initial_rows - len(df_clean)
+total_blanks = blank_mask.sum()
+print(f"\n   Total rows with blanks: {total_blanks:,}")
 
-print(f"\n❌ Removed {invalid_count:,} rows with blank values")
-
-# Show examples
-if invalid_count > 0:
-    invalid_df = df[~valid_mask]
-    print("\n   Examples of removed rows (incident_number):")
-    for idx in invalid_df.head(15).index:
-        inc_num = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
+# Show examples of blank rows
+if total_blanks > 0:
+    blank_df = df[blank_mask]
+    print("\n   Examples of blank rows (incident_number | Cluster Group):")
+    for idx in blank_df.head(10).index:
+        inc = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
         cg = df.loc[idx, cluster_col] if cluster_col else 'N/A'
-        print(f"      Row {idx}: inc='{str(inc_num)[:40]}', cluster='{str(cg)[:20]}'")
+        rca = df.loc[idx, rca_col] if rca_col else 'N/A'
+        print(f"      Row {idx}: '{str(inc)[:30]}' | CG='{cg}' | RCA='{rca}'")
 
-print(f"\n✅ Valid rows: {len(df_clean):,}")
+# Remove blanks
+print("\n🗑️ Removing blank rows...")
+df_clean = df[~blank_mask].copy()
+
+# Drop helper column
+if '_cluster_display' in df_clean.columns:
+    df_clean = df_clean.drop('_cluster_display', axis=1)
+
+removed = initial_rows - len(df_clean)
+print(f"   Removed: {removed:,} rows")
+print(f"   Remaining: {len(df_clean):,} rows")
+
+# Verify - create new pivot
+print("\n📊 NEW PIVOT TABLE (after cleaning):")
+print("-" * 50)
+if cluster_col:
+    new_pivot = df_clean[cluster_col].value_counts().head(10)
+    for val, count in new_pivot.items():
+        print(f"   {str(val)[:40]}: {count:,}")
+    
+    # Check for blanks
+    remaining_blanks = df_clean[cluster_col].isna().sum() + (df_clean[cluster_col].astype(str).str.strip() == '').sum()
+    print(f"\n   ✅ Remaining blanks: {remaining_blanks}")
 
 # Save
 print(f"\n💾 Saving to {output_file}...")
 df_clean.to_csv(output_file, index=False, encoding='utf-8')
 
-print("\n" + "=" * 60)
-print("📊 SUMMARY")
-print("=" * 60)
+print("\n" + "=" * 70)
+print("📊 FINAL SUMMARY")
+print("=" * 70)
 print(f"   Original rows:  {initial_rows:,}")
-print(f"   Removed:        {invalid_count:,}")
+print(f"   Blanks removed: {removed:,}")
 print(f"   Final rows:     {len(df_clean):,}")
-print("✅ DONE!")
+print("✅ DONE! Use cleaned file for your Pivot Table in Excel.")
