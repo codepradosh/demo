@@ -36,7 +36,7 @@ def main():
     # Load CSV
     print("📖 Loading CSV...")
     try:
-        df = pd.read_csv(args.input_csv)
+        df = pd.read_csv(args.input_csv, low_memory=False)
         initial_rows = len(df)
         print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
     except Exception as e:
@@ -57,14 +57,41 @@ def main():
         print(f"   Available columns: {df.columns.tolist()}")
         sys.exit(1)
     
+    # DEBUG: Check for garbage incident numbers and their Cluster Group values
+    print(f"\n🔍 DEBUG: Checking for invalid incident_number rows...")
+    if 'incident_number' in df.columns:
+        # Find rows that don't start with INC
+        def is_invalid_incident(val):
+            if pd.isna(val):
+                return True
+            s = str(val).strip()
+            return not (s.startswith('INC1') or s.startswith('INC2'))
+        
+        invalid_mask = df['incident_number'].apply(is_invalid_incident)
+        invalid_rows = df[invalid_mask]
+        
+        if len(invalid_rows) > 0:
+            print(f"   Found {len(invalid_rows):,} rows with invalid incident_number")
+            print(f"   Sample invalid incident_numbers: {invalid_rows['incident_number'].head(5).tolist()}")
+            print(f"   Their Cluster Group values: {invalid_rows[cluster_col].head(5).tolist()}")
+            
+            # Remove these invalid rows
+            df = df[~invalid_mask].copy()
+            print(f"   ✅ Removed {len(invalid_rows):,} invalid rows")
+        else:
+            print(f"   All incident_numbers are valid (start with INC1 or INC2)")
+    
+    # STEP 2: Remove rows where Cluster Group is empty
     print(f"\n🔍 Removing rows where '{cluster_col}' is empty...")
     
     # Remove rows where Cluster Group is empty (NaN or empty string)
     mask = df[cluster_col].notna() & (df[cluster_col].astype(str).str.strip() != '')
     df_cleaned = df[mask].copy()
     
-    rows_removed = initial_rows - len(df_cleaned)
-    print(f"   ✅ Removed {rows_removed:,} rows with empty Cluster Group")
+    rows_removed_cluster = len(df) - len(df_cleaned)
+    print(f"   ✅ Removed {rows_removed_cluster:,} rows with empty Cluster Group")
+    
+    total_removed = initial_rows - len(df_cleaned)
     
     # Save output
     print(f"\n💾 Saving cleaned CSV...")
@@ -80,7 +107,7 @@ def main():
     print("📊 SUMMARY")
     print("=" * 60)
     print(f"   Original rows:  {initial_rows:,}")
-    print(f"   Rows removed:   {rows_removed:,}")
+    print(f"   Rows removed:   {total_removed:,}")
     print(f"   Final rows:     {len(df_cleaned):,}")
     print("✅ Done!")
 
