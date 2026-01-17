@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-CSV to Excel - Two-step approach:
-1. First convert CSV to XLSX (raw)
-2. Then read XLSX, filter INC rows, save cleaned XLSX
+CSV to Excel - Clean illegal characters before saving
 """
 
 import pandas as pd
 import sys
-import os
+import re
 
 if len(sys.argv) < 3:
     print("Usage: python to_excel.py input.csv output.xlsx")
@@ -16,62 +14,49 @@ if len(sys.argv) < 3:
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
+# Function to remove illegal Excel characters
+ILLEGAL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+def clean_illegal_chars(val):
+    if pd.isna(val):
+        return val
+    return ILLEGAL_CHARS_RE.sub('', str(val))
+
 print("=" * 60)
-print("📊 CSV TO EXCEL (TWO-STEP APPROACH)")
+print("📊 CSV TO EXCEL")
 print("=" * 60)
 
-# ========== STEP 1: Convert CSV to XLSX (raw) ==========
-print("\n" + "=" * 40)
-print("STEP 1: Convert CSV to XLSX (raw)")
-print("=" * 40)
-
-temp_xlsx = "temp_raw.xlsx"
-
+# Step 1: Read CSV
 print(f"\n📖 Reading CSV: {input_file}")
 df = pd.read_csv(input_file, low_memory=False)
 print(f"   Loaded {len(df):,} rows")
 
-print(f"\n💾 Saving to temp XLSX: {temp_xlsx}")
-df.to_excel(temp_xlsx, index=False, engine='openpyxl')
-print(f"   ✅ Saved!")
-
-# ========== STEP 2: Read XLSX, filter, save ==========
-print("\n" + "=" * 40)
-print("STEP 2: Read XLSX, filter INC rows, save")
-print("=" * 40)
-
-print(f"\n📖 Reading XLSX: {temp_xlsx}")
-df2 = pd.read_excel(temp_xlsx, engine='openpyxl')
-print(f"   Loaded {len(df2):,} rows")
-
-# Filter: Keep only rows where incident_number starts with 'INC'
+# Step 2: Filter INC rows
 print("\n🔍 Filtering: Keep only INC rows...")
-if 'incident_number' in df2.columns:
-    initial = len(df2)
-    mask = df2['incident_number'].astype(str).str.startswith('INC')
-    df2 = df2[mask].copy()
-    removed = initial - len(df2)
-    print(f"   Removed {removed:,} non-INC rows")
-    print(f"   Remaining: {len(df2):,}")
+if 'incident_number' in df.columns:
+    initial = len(df)
+    mask = df['incident_number'].astype(str).str.startswith('INC')
+    df = df[mask].copy()
+    print(f"   Removed {initial - len(df):,} non-INC rows")
+    print(f"   Remaining: {len(df):,}")
 
-# Clean newlines
-print("\n🧹 Cleaning newlines...")
-for col in df2.columns:
-    if df2[col].dtype == 'object':
-        df2[col] = df2[col].astype(str).str.replace('\n', ' ', regex=False)
-        df2[col] = df2[col].astype(str).str.replace('\r', ' ', regex=False)
+# Step 3: Clean ALL text columns (remove newlines + illegal chars)
+print("\n🧹 Cleaning text columns...")
+for col in df.columns:
+    if df[col].dtype == 'object':
+        # Remove newlines
+        df[col] = df[col].astype(str).str.replace('\n', ' ', regex=False)
+        df[col] = df[col].astype(str).str.replace('\r', ' ', regex=False)
+        # Remove illegal Excel characters
+        df[col] = df[col].apply(clean_illegal_chars)
 
-# Save final
-print(f"\n💾 Saving final XLSX: {output_file}")
-df2.to_excel(output_file, index=False, engine='openpyxl')
-print(f"   ✅ Saved!")
+print("   ✅ Cleaned!")
 
-# Cleanup temp file
-os.remove(temp_xlsx)
-print(f"   🗑️ Removed temp file")
+# Step 4: Save to Excel
+print(f"\n💾 Saving to Excel: {output_file}")
+df.to_excel(output_file, index=False, engine='openpyxl')
+print("   ✅ Saved!")
 
 print("\n" + "=" * 60)
-print("📊 FINAL SUMMARY")
-print("=" * 60)
-print(f"   Final rows: {len(df2):,}")
-print(f"\n✅ Open {output_file} in Excel!")
+print(f"✅ DONE! Final: {len(df):,} rows")
+print(f"   Open {output_file} in Excel")
