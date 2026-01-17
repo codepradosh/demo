@@ -1,66 +1,70 @@
 #!/usr/bin/env python3
 """
-Debug script - shows raw file contents
+Extract ONLY valid INC lines from corrupted CSV
 """
 
 import sys
 
-if len(sys.argv) < 2:
-    print("Usage: python debug_file.py input.csv")
+if len(sys.argv) < 3:
+    print("Usage: python extract_valid.py input.csv output.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
+output_file = sys.argv[2]
 
 print("=" * 70)
-print("🔍 DEBUG: RAW FILE ANALYSIS")
+print("🔧 EXTRACTING VALID LINES FROM CORRUPTED CSV")
 print("=" * 70)
-print(f"File: {input_file}")
+print(f"Input:  {input_file}")
+print(f"Output: {output_file}")
 
-# Read as raw text
+# Read file
+print("\n📖 Reading file...")
 with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
     lines = f.readlines()
 
 total_lines = len(lines)
-print(f"\nTotal lines in file: {total_lines:,}")
+print(f"   Total lines in file: {total_lines:,}")
 
-# Show LAST 50 lines (where garbage usually is)
-print("\n" + "=" * 50)
-print("LAST 50 LINES OF FILE:")
-print("=" * 50)
-for i, line in enumerate(lines[-50:], start=total_lines-50):
-    # Get first field (incident_number)
-    first_field = line.split(',')[0][:60]
-    print(f"Line {i}: '{first_field}'")
-
-# Count lines NOT starting with INC (excluding header)
-print("\n" + "=" * 50)
-print("LINES NOT STARTING WITH 'INC':")
-print("=" * 50)
-non_inc_count = 0
-non_inc_examples = []
-for i, line in enumerate(lines[1:], start=1):  # Skip header
-    first_field = line.split(',')[0].strip()
-    if not first_field.startswith('INC'):
-        non_inc_count += 1
-        if len(non_inc_examples) < 30:
-            non_inc_examples.append(f"Line {i}: '{first_field[:50]}'")
-
-print(f"Count: {non_inc_count}")
-if non_inc_examples:
-    print("\nExamples:")
-    for ex in non_inc_examples:
-        print(f"   {ex}")
-
-# Also check for blank first fields
-print("\n" + "=" * 50)
-print("LINES WITH BLANK/EMPTY FIRST FIELD:")
-print("=" * 50)
+# Extract valid lines
+print("\n🔍 Extracting valid lines...")
+valid_lines = []
+header_saved = False
 blank_count = 0
-for i, line in enumerate(lines[1:], start=1):
-    first_field = line.split(',')[0].strip()
-    if first_field == '' or first_field.lower() == 'nan':
-        blank_count += 1
-        if blank_count <= 10:
-            print(f"   Line {i}: entire line = '{line[:100]}'")
+garbage_count = 0
 
-print(f"\nTotal blank first fields: {blank_count}")
+for i, line in enumerate(lines):
+    # Get first field
+    first_field = line.split(',')[0].strip()
+    
+    # Save header (first non-empty line with 'incident_number')
+    if not header_saved:
+        if 'incident_number' in first_field.lower():
+            valid_lines.append(line)
+            header_saved = True
+            print(f"   Found header at line {i}")
+            continue
+    
+    # Check if line starts with INC
+    if first_field.startswith('INC'):
+        valid_lines.append(line)
+    elif first_field == '' or first_field.lower() == 'nan':
+        blank_count += 1
+    else:
+        garbage_count += 1
+        if garbage_count <= 10:
+            print(f"   Garbage line {i}: '{first_field[:50]}'")
+
+print(f"\n📊 Results:")
+print(f"   Valid INC lines: {len(valid_lines):,}")
+print(f"   Blank lines removed: {blank_count:,}")
+print(f"   Garbage lines removed: {garbage_count:,}")
+
+# Save valid lines
+print(f"\n💾 Saving to {output_file}...")
+with open(output_file, 'w', encoding='utf-8') as f:
+    f.writelines(valid_lines)
+
+print(f"\n✅ DONE!")
+print(f"   Output file has {len(valid_lines):,} lines (including header)")
+print(f"\n   Open {output_file} in Excel - no more blanks or garbage!")
