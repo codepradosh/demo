@@ -1,98 +1,643 @@
 #!/usr/bin/env python3
 """
-CSV to Excel - Two-step approach:
-1. First convert CSV to XLSX (raw, no processing)
-2. Then read XLSX, filter, save
+Extract and Categorize Pipeline
+Extracts incident data from Atlas/gsnow and categorizes with GPT-5-nano
+
+Workflow:
+1. Extract T-1 data from Atlas and gsnow databases
+2. Map and combine datasets
+3. Add crew categorization and automation status
+4. Export to CSV
+5. Categorize with GPT-5-nano (cluster-method: gpt, skip-drain3, max-workers: 50)
+6. Save categorized data to CSV
 """
 
-import pandas as pd
-import sys
-import re
 import os
+import sys
+import datetime
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import traceback
 
-if len(sys.argv) < 3:
-    print("Usage: python to_excel.py input.csv output.xlsx")
-    print("Note: Output MUST be .xlsx extension!")
-    sys.exit(1)
+# Add categorization directory to path to import category_latest functions
+SCRIPT_DIR = Path(__file__).parent
+CATEGORIZATION_DIR = SCRIPT_DIR / "categorization"
+DATA_EXTRACTION_DIR = SCRIPT_DIR / "data_extraction"
 
-input_file = sys.argv[1]
-output_file = sys.argv[2]
+# Add both directories to path for flexible imports
+sys.path.insert(0, str(CATEGORIZATION_DIR))
+sys.path.insert(0, str(DATA_EXTRACTION_DIR))
 
-# Check extension
-if not output_file.endswith('.xlsx'):
-    print("❌ ERROR: Output file must have .xlsx extension!")
-    print(f"   You provided: {output_file}")
-    print(f"   Example: python to_excel.py input.csv final.xlsx")
-    sys.exit(1)
+# Import data extraction class
+# Try both import paths to support different folder structures
+try:
+    # Local structure: data_extraction/initial_load_incidents.py
+    from data_extraction.initial_load_incident import InitialLoadIncidents
+except ImportError:
+    try:
+        # AWS structure: all files in data_extraction folder
+        from initial_load_incident import InitialLoadIncidents
+    except ImportError as e:
+        print(f"Error: Could not import InitialLoadIncidents: {e}")
+        raise
 
-# Function to remove illegal Excel characters
-ILLEGAL_CHARS_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+# Import categorization functions from category_latest
+# Try both import paths to support different folder structures
+try:
+    # Local structure: categorization/category_latest.py
+    from category_latest import (
+        categorize_with_gpt4o_mini,
+        cluster_categories_gpt_batch,
+        clean_description_rca,
+        extract_keywords_yake_rca,
+        OPENAI_API_KEY,
+        OPENAI_DEPLOYMENT_NAME,
+        OPENAI_ENDPOINT,
+        RCA_CATEGORY,
+        CLUSTER_GROUP,
+        CLEANED_DESCRIPTION,
+        KEYWORDS
+    )
+    CATEGORIZATION_AVAILABLE = True
+except ImportError:
+    try:
+        # AWS structure: category_latest.py in data_extraction folder
+        from data_extraction.category_latest import (
+            categorize_with_gpt4o_mini,
+            cluster_categories_gpt_batch,
+            clean_description_rca,
+            extract_keywords_yake_rca,
+            OPENAI_API_KEY,
+            OPENAI_DEPLOYMENT_NAME,
+            OPENAI_ENDPOINT,
+            RCA_CATEGORY,
+            CLUSTER_GROUP,
+            CLEANED_DESCRIPTION,
+            KEYWORDS
+        )
+        CATEGORIZATION_AVAILABLE = True
+    except ImportError as e:
+        print(f"Warning: Could not import categorization functions: {e}")
+        CATEGORIZATION_AVAILABLE = False
 
-def clean_cell(val):
-    if pd.isna(val):
-        return val
-    s = str(val)
-    # Remove illegal chars
-    s = ILLEGAL_CHARS_RE.sub('', s)
-    # Remove newlines
-    s = s.replace('\n', ' ').replace('\r', ' ')
-    return s
 
-print("=" * 60)
-print("📊 CSV TO EXCEL (TWO-STEP)")
-print("=" * 60)
+class ExtractAndCategorize:
+    """
+    Integrated pipeline for data extraction and GPT categorization
+    """
+    
+    def __init__(self, output_dir=None, use_env_vars=True):
+        """
+        Initialize the pipeline
+        
+        Args:
+            output_dir: Directory to save CSV files (default: Service_Catalog/output)
+            use_env_vars: Whether to use environment variables for configuration
+        """
+        self.use_env_vars = use_env_vars
+        
+        # Set output directory
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            self.output_dir = SCRIPT_DIR / "output"
+        
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize data extractor
+        self.extractor = InitialLoadIncidents(
+            project_source=str(SCRIPT_DIR.parent) if SCRIPT_DIR.parent.exists() else None,
+            use_env_vars=use_env_vars
+        )
+        
+        print("✅ Extract and Categorize Pipeline initialized")
+        print(f"📁 Output directory: {self.output_dir}")
+    
+    def extract_data(self):
+        """
+        Extract data from Atlas and gsnow databases
+        
+        Returns:
+            DataFrame with combined data, or None if extraction fails
+        """
+        print("\n" + "=" * 80)
+        print("📥 STEP 1: EXTRACTING DATA FROM DATABASES")
+        print("=" * 80)
+        
+        # Connect to databases
+        if not self.extractor.connect():
+            print("❌ Failed to establish database connections")
+            return None
+        
+        # Fetch data from both sources
+        df_atlas = self.extractor.fetch_atlas_data()
+        df_gsnow = self.extractor.fetch_gsnow_data()
+        
+        # Map and combine
+        df_combined = self.extractor.map_and_combine(df_atlas, df_gsnow)
+        
+        # DEBUG: Print columns
+        print(f"\n   🔍 Columns in combined dataframe: {df_combined.columns.tolist()}")
+        
+        # CLEANING: Filter invalid incident numbers
+        if 'incident_number' in df_combined.columns:
+            initial_count = len(df_combined)
+            print(f"   🧹 Validating {initial_count:,} records...")
+            
+            # 1. Drop empty/NaN incident numbers
+            df_combined = df_combined.dropna(subset=['incident_number'])
+            
+            # 1.5 NEW RULE: Drop if 'opened_at' is empty/invalid (datetime column)
+            if 'opened_at' in df_combined.columns:
+                pre_open_filter = len(df_combined)
+                # For datetime columns, use pd.isna() which catches NaT (Not a Time)
+                df_combined = df_combined[~pd.isna(df_combined['opened_at'])].copy()
+                dropped_opened = pre_open_filter - len(df_combined)
+                if dropped_opened > 0:
+                    print(f"      - Dropped {dropped_opened:,} records with empty/invalid 'opened_at'")
+                else:
+                    print(f"      - All records have valid 'opened_at' values")
+            
+            # 1.6 NEW RULE: Drop if 'short_description' is empty/missing
+            desc_col = None
+            if 'short_description' in df_combined.columns:
+                desc_col = 'short_description'
+            elif 'Short_Description' in df_combined.columns:
+                desc_col = 'Short_Description'
+            
+            if desc_col:
+                pre_desc_filter = len(df_combined)
+                # Remove rows where short_description is NaN or empty string
+                df_combined = df_combined[
+                    df_combined[desc_col].notna() & 
+                    (df_combined[desc_col].astype(str).str.strip() != '')
+                ].copy()
+                dropped_desc = pre_desc_filter - len(df_combined)
+                if dropped_desc > 0:
+                    print(f"      - Dropped {dropped_desc:,} records with empty 'short_description'")
+            
+            # 2. Keep only rows starting with 'INC1' or 'INC2' (Simple Python check)
+            def is_valid_incident(val):
+                if pd.isna(val):
+                    return False
+                s = str(val).strip()
+                return s.startswith('INC1') or s.startswith('INC2')
+            
+            valid_mask = df_combined['incident_number'].apply(is_valid_incident)
+            
+            # Debug: what are we dropping?
+            dropped_rows = df_combined[~valid_mask]
+            
+            if not dropped_rows.empty:
+                print(f"      - FOUND {len(dropped_rows):,} INVALID RECORDS (Not INC1/INC2)!")
+                print(f"      - Examples: {dropped_rows['incident_number'].head(5).tolist()}")
+            else:
+                print(f"      - No invalid records found during INC1/INC2 check.")
+            
+            df_combined = df_combined[valid_mask].copy()
+            
+            final_count = len(df_combined)
+            dropped = initial_count - final_count
+            if dropped > 0:
+                print(f"      - Dropped {dropped:,} invalid records (missing or not starting with INC1/INC2)")
+            print(f"   ✅ Data validation passed. Count: {final_count:,}")
+            
+            # DEBUG: Print first 10 incident numbers to verify
+            print(f"\n   🔍 DEBUG - First 10 incident_number values after validation:")
+            print(f"      {df_combined['incident_number'].head(10).tolist()}")
+            
+            # DEBUG: Save intermediate file to check
+            debug_path = self.output_dir / "DEBUG_after_validation.csv"
+            df_combined[['incident_number', 'opened_at']].head(100).to_csv(debug_path, index=False)
+            print(f"   📝 DEBUG file saved: {debug_path}")
+            
+            # Save intermediate debug file
+            # df_combined.to_csv("debug_cleaned_data.csv", index=False)
+            # print("   (Saved debug_cleaned_data.csv)")
+        else:
+            print(f"⚠️ Warning: 'incident_number' column not found! Available columns: {df_combined.columns.tolist()}")
+        
+        if df_combined is None:
+            print("❌ Failed to combine data")
+            return None
+        
+        # Add crew categorization
+        df_combined = self.extractor.add_crew_category(df_combined)
+        
+        # Add automation status
+        df_combined = self.extractor.add_automation_status(df_combined)
+        
+        # Populate operational_impact from u_operational_impact if available
+        if 'u_operational_impact' in df_combined.columns:
+            if 'operational_impact' not in df_combined.columns:
+                df_combined['operational_impact'] = df_combined['u_operational_impact']
+            else:
+                mask = df_combined['operational_impact'].isna() | (df_combined['operational_impact'] == '')
+                df_combined.loc[mask, 'operational_impact'] = df_combined.loc[mask, 'u_operational_impact']
+        
+        print(f"\n✅ Data extraction completed: {len(df_combined):,} records")
+        return df_combined
+    
+    def export_to_csv(self, df, filename=None):
+        """
+        Export DataFrame to CSV
+        
+        Args:
+            df: DataFrame to export
+            filename: Optional filename (default: incidents_YYYYMMDD_HHMMSS.csv)
+        
+        Returns:
+            Path to saved CSV file
+        """
+        print("\n" + "=" * 80)
+        print("💾 STEP 2: EXPORTING TO CSV")
+        print("=" * 80)
+        
+        if df is None or len(df) == 0:
+            print("❌ No data to export")
+            return None
+        
+        # Generate filename if not provided
+        if filename is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"incidents_{timestamp}.csv"
+        
+        csv_path = self.output_dir / filename
+        output_path = self.output_dir / filename
+        
+        # FINAL SAFETY CHECK: Ensure no garbage IDs in output
+        # Using simple Python check to guarantee it works
+        if df is not None and 'incident_number' in df.columns:
+            original_len = len(df)
+            
+            # Simple Python filter - check each row's incident_number
+            def is_valid_incident(val):
+                if pd.isna(val):
+                    return False
+                s = str(val).strip()
+                return s.startswith('INC1') or s.startswith('INC2')
+            
+            # Apply filter
+            valid_rows = df['incident_number'].apply(is_valid_incident)
+            df_clean = df[valid_rows].copy()
+            
+            # Also remove rows with empty opened_at
+            if 'opened_at' in df_clean.columns:
+                df_clean = df_clean[~pd.isna(df_clean['opened_at'])].copy()
+            
+            # Also remove rows with empty short_description
+            desc_col = 'short_description' if 'short_description' in df_clean.columns else 'Short_Description' if 'Short_Description' in df_clean.columns else None
+            if desc_col and desc_col in df_clean.columns:
+                df_clean = df_clean[
+                    df_clean[desc_col].notna() & 
+                    (df_clean[desc_col].astype(str).str.strip() != '')
+                ].copy()
+            
+            removed = original_len - len(df_clean)
+            if removed > 0:
+                print(f"⚠️ SAFETY CHECK: Removed {removed} invalid records right before save!")
+                # Show examples of what was removed
+                invalid_df = df[~valid_rows]
+                if len(invalid_df) > 0:
+                    print(f"   Examples removed: {invalid_df['incident_number'].head(5).tolist()}")
+                df = df_clean
+            
+            # Final verification
+            print(f"   ✅ Final record count: {len(df):,}")
+        
+        # CRITICAL: Remove newlines from ALL text columns before saving
+        # This prevents garbage rows appearing in Excel
+        print("   🧹 Cleaning newlines from text columns...")
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].astype(str).str.replace('\n', ' ', regex=False)
+                df[col] = df[col].astype(str).str.replace('\r', ' ', regex=False)
+        
+        try:
+            df.to_csv(output_path, index=False, encoding='utf-8')
+            print(f"✅ Exported {len(df):,} records to: {output_path}")
+            print(f"   Columns: {len(df.columns)}")
+            print(f"   File size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
+            return output_path
+        except Exception as e:
+            print(f"❌ Error exporting to CSV: {e}")
+            traceback.print_exc()
+            return None
+    
+    def categorize_with_gpt(self, df, max_workers=50, cluster_method='gpt'):
+        """
+        Categorize incidents using GPT-5-nano
+        
+        Args:
+            df: DataFrame with incident data
+            max_workers: Number of parallel workers (default: 50)
+            cluster_method: Clustering method ('gpt', 'rapidfuzz', or 'both')
+        
+        Returns:
+            DataFrame with categorization columns added
+        """
+        print("\n" + "=" * 80)
+        print("🤖 STEP 3: CATEGORIZING WITH GPT-5-NANO")
+        print("=" * 80)
+        
+        if not CATEGORIZATION_AVAILABLE:
+            print("❌ Categorization functions not available")
+            return df
+        
+        # Check API key
+        if not OPENAI_API_KEY or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
+            print("❌ Azure OpenAI API key not configured")
+            print("   Please update OPENAI_API_KEY in category_latest.py")
+            return df
+        
+        print(f"📊 Processing {len(df):,} incidents")
+        print(f"🔧 Configuration:")
+        print(f"   - Model: {OPENAI_DEPLOYMENT_NAME}")
+        print(f"   - Endpoint: {OPENAI_ENDPOINT}")
+        print(f"   - Max workers: {max_workers}")
+        print(f"   - Cluster method: {cluster_method}")
+        print(f"   - Skip Drain3: Yes (for speed)")
+        
+        # Find description columns
+        desc_column = None
+        if 'short_description' in df.columns:
+            desc_column = 'short_description'
+        elif 'Short_Description' in df.columns:
+            desc_column = 'Short_Description'
+        else:
+            print("❌ Required column 'short_description' not found")
+            return df
+        
+        desc_column_full = None
+        if 'description' in df.columns:
+            desc_column_full = 'description'
+        elif 'DESCRIPTION' in df.columns:
+            desc_column_full = 'DESCRIPTION'
+        
+        # Step 1: Clean descriptions
+        print("\n1️⃣ Cleaning descriptions with RCA focus...")
+        from tqdm import tqdm
+        tqdm.pandas(desc="Cleaning descriptions")
+        
+        df[CLEANED_DESCRIPTION] = df[desc_column].progress_apply(clean_description_rca)
+        
+        # Fallback to full description if cleaned is empty
+        if desc_column_full:
+            mask = (df[CLEANED_DESCRIPTION].isna()) | (df[CLEANED_DESCRIPTION] == "")
+            df.loc[mask, CLEANED_DESCRIPTION] = df.loc[mask, desc_column_full].apply(clean_description_rca)
+        
+        print(f"   ✅ Cleaned {len(df):,} descriptions")
+        
+        # Step 2: Extract keywords (optional, for reference)
+        print("\n2️⃣ Extracting keywords with YAKE...")
+        tqdm.pandas(desc="Extracting keywords")
+        df[KEYWORDS] = df[CLEANED_DESCRIPTION].progress_apply(
+            lambda x: extract_keywords_yake_rca(x, use_hybrid=True, top_keywords=12)
+        )
+        print(f"   ✅ Extracted keywords for {len(df):,} records")
+        
+        # Step 2.5: Apply rule-based categorization for specific KPCI patterns
+        print("\n2️⃣.5 Applying rule-based KPCI categorization...")
+        
+        # Initialize RCA_CATEGORY and CLUSTER_GROUP columns for rule-based matches
+        df[RCA_CATEGORY] = None
+        df[CLUSTER_GROUP] = None
+        
+        # Rule 1: KPCI SourcesNotSent pattern
+        # Pattern: "KPCI SourcesNotSent" or "kpci sourcesnotsent" (case-insensitive)
+        pattern1 = df[CLEANED_DESCRIPTION].str.contains(
+            r'kpci\s+sourcesnotsent', 
+            case=False, 
+            na=False, 
+            regex=True
+        )
+        df.loc[pattern1, RCA_CATEGORY] = "KPCI Source Not Sent"
+        df.loc[pattern1, CLUSTER_GROUP] = "KPCI Source Not Sent"
+        
+        # Rule 2: KPCI PhoneHomeAgent pattern
+        # Pattern: "PhoneHomeAgent" or "Phone Home" with "KPCI" (case-insensitive)
+        pattern2 = df[CLEANED_DESCRIPTION].str.contains(
+            r'(phonehomeagent|phone\s+home).*kpci|kpci.*(phonehomeagent|phone\s+home)', 
+            case=False, 
+            na=False, 
+            regex=True
+        )
+        df.loc[pattern2, RCA_CATEGORY] = "KPCI Phone Home Failed"
+        df.loc[pattern2, CLUSTER_GROUP] = "KPCI Phone Home Failed"
+        
+        rule_based_count = df[RCA_CATEGORY].notna().sum()
+        print(f"   ✅ Applied rule-based categorization to {rule_based_count:,} records")
+        if rule_based_count > 0:
+            print(f"      - KPCI Source Not Sent: {(df[RCA_CATEGORY] == 'KPCI Source Not Sent').sum():,}")
+            print(f"      - KPCI Phone Home Failed: {(df[RCA_CATEGORY] == 'KPCI Phone Home Failed').sum():,}")
+        
+        # Step 3: GPT-5-nano categorization (parallel processing)
+        print("\n3️⃣ Categorizing with GPT-5-nano (parallel processing)...")
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+        import time
+        
+        # Initialize RCA_CATEGORY column if not already present, but preserve existing values
+        if RCA_CATEGORY not in df.columns:
+            df[RCA_CATEGORY] = ""
+        else:
+            # Provide default for completely missing/NaN values only
+             df[RCA_CATEGORY] = df[RCA_CATEGORY].fillna("")
+        
+        # Identify rows that need GPT categorization (empty RCA_CATEGORY)
+        # We only process rows where RCA_CATEGORY is empty/blank
+        rows_to_process = df[df[RCA_CATEGORY] == ""].index
+        print(f"   ℹ️ Skipping {len(df) - len(rows_to_process):,} already categorized records")
+        print(f"   ℹ️ Sending {len(rows_to_process):,} records to GPT")
 
-# ========== STEP 1: Read CSV and clean ==========
-print("\n🔷 STEP 1: Read CSV & Clean")
-print("-" * 40)
+        
+        # Batch processing
+        batch_size = 1000
+        total_rows = len(df)
+        num_batches = (total_rows + batch_size - 1) // batch_size
+        
+        print(f"   Processing in {num_batches} batches of {batch_size} tickets...")
+        
+        def categorize_row_with_index(idx, row):
+            """Categorize a single row and return index and result"""
+            result = categorize_with_gpt4o_mini(
+                row[desc_column],
+                row[desc_column_full] if desc_column_full else None,
+                OPENAI_API_KEY,
+                OPENAI_DEPLOYMENT_NAME
+            )
+            return idx, result
+        
+        # Process batches
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, total_rows)
+            batch_df = df.iloc[start_idx:end_idx].copy()
+            
+            print(f"\n   Batch {batch_num + 1}/{num_batches} (rows {start_idx + 1}-{end_idx})...")
+            batch_start_time = time.time()
+            
+            # Prepare tasks (filter out already categorized rows)
+            tasks = [
+                (idx, row) for idx, row in batch_df.iterrows() 
+                if str(row[RCA_CATEGORY]) == ""
+            ]
+            
+            if not tasks:
+                print(f"   ℹ️ Batch {batch_num + 1}: All records already categorized. Skipping.")
+                continue
+            
+            # Process batch in parallel
+            results = {}
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(categorize_row_with_index, idx, row): idx 
+                    for idx, row in tasks
+                }
+                
+                with tqdm(total=len(tasks), desc=f"   Batch {batch_num + 1}", unit="ticket") as pbar:
+                    for future in as_completed(future_to_idx):
+                        try:
+                            idx, category = future.result()
+                            results[idx] = category
+                            pbar.update(1)
+                        except Exception as e:
+                            idx = future_to_idx[future]
+                            results[idx] = "Categorization Failed"
+                            pbar.update(1)
+            
+            # Update main dataframe
+            for idx, category in results.items():
+                df.loc[idx, RCA_CATEGORY] = category
+            
+            batch_time = time.time() - batch_start_time
+            batch_rate = len(tasks) / batch_time * 60 if batch_time > 0 else 0
+            print(f"   ✅ Batch completed in {batch_time:.1f}s ({batch_rate:.1f} tickets/min)")
+        
+        print(f"\n   ✅ GPT categorization completed for {len(df):,} records")
+        print(f"   📊 Unique categories: {df[RCA_CATEGORY].nunique():,}")
+        
+        # Step 4: Cluster categories with GPT (if requested)
+        if cluster_method in ['gpt', 'both']:
+            print("\n4️⃣ Clustering categories with GPT...")
+            df = cluster_categories_gpt_batch(
+                df, 
+                RCA_CATEGORY, 
+                OPENAI_API_KEY, 
+                OPENAI_DEPLOYMENT_NAME,
+                batch_size=50
+            )
+            print(f"   ✅ Clustered to {df[CLUSTER_GROUP].nunique():,} groups")
+            
+            # CRITICAL: Restore the rule-based KPCI CLUSTER_GROUP values
+            # (In case GPT clustering overwrote them with something generic)
+            
+            # Restore Rule 1: KPCI SourcesNotSent
+            mask1 = df[RCA_CATEGORY] == "KPCI Source Not Sent"
+            df.loc[mask1, CLUSTER_GROUP] = "KPCI Source Not Sent"
+            
+            # Restore Rule 2: KPCI PhoneHomeAgent
+            mask2 = df[RCA_CATEGORY] == "KPCI Phone Home Failed"
+            df.loc[mask2, CLUSTER_GROUP] = "KPCI Phone Home Failed"
+            
+            print(f"   ✅ Restored rule-based cluster groups (count: {(mask1.sum() + mask2.sum()):,})")
+        else:
+            # Create CLUSTER_GROUP column as copy of RCA_CATEGORY
+            df[CLUSTER_GROUP] = df[RCA_CATEGORY]
+        
+        return df
+    
+    def run(self, max_workers=50, cluster_method='gpt'):
+        """
+        Run the complete pipeline
+        
+        Args:
+            max_workers: Number of parallel workers for GPT (default: 50)
+            cluster_method: Clustering method ('gpt', 'rapidfuzz', or 'both')
+        
+        Returns:
+            Path to final categorized CSV file
+        """
+        print("=" * 80)
+        print("🚀 EXTRACT AND CATEGORIZE PIPELINE")
+        print("=" * 80)
+        print(f"📅 Date range: {self.extractor.start_date} to {self.extractor.end_date}")
+        print(f"🏢 Filter: DH- assignment groups")
+        print(f"🤖 GPT workers: {max_workers}")
+        print(f"🔗 Cluster method: {cluster_method}")
+        print("")
+        
+        # Step 1: Extract data
+        df = self.extract_data()
+        if df is None:
+            print("\n❌ Pipeline failed: Data extraction error")
+            return None
+        
+        # Step 2: Export to CSV (before categorization)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = self.export_to_csv(df, f"incidents_extracted_{timestamp}.csv")
+        if csv_path is None:
+            print("\n❌ Pipeline failed: CSV export error")
+            return None
+        
+        # Step 3: Categorize with GPT
+        df = self.categorize_with_gpt(df, max_workers=max_workers, cluster_method=cluster_method)
+        
+        # Step 4: Export categorized data to CSV
+        final_csv_path = self.export_to_csv(df, f"incidents_categorized_{timestamp}.csv")
+        
+        # Summary
+        print("\n" + "=" * 80)
+        print("✅ PIPELINE COMPLETED SUCCESSFULLY")
+        print("=" * 80)
+        print(f"📊 Total records processed: {len(df):,}")
+        print(f"📁 Extracted data: {csv_path}")
+        print(f"📁 Categorized data: {final_csv_path}")
+        
+        if RCA_CATEGORY in df.columns:
+            print(f"\n📈 Categorization Stats:")
+            print(f"   - Unique RCA categories: {df[RCA_CATEGORY].nunique():,}")
+            if CLUSTER_GROUP in df.columns:
+                print(f"   - Unique cluster groups: {df[CLUSTER_GROUP].nunique():,}")
+        
+        if 'crew' in df.columns:
+            print(f"\n👥 Crew breakdown:")
+            crew_counts = df['crew'].value_counts().head(5)
+            for crew, count in crew_counts.items():
+                print(f"   - {crew}: {count:,} records")
+        
+        return final_csv_path
 
-print(f"📖 Reading: {input_file}")
-df = pd.read_csv(input_file, low_memory=False)
-print(f"   Loaded {len(df):,} rows")
 
-# Clean ALL columns
-print("🧹 Cleaning illegal characters...")
-for col in df.columns:
-    if df[col].dtype == 'object':
-        df[col] = df[col].apply(clean_cell)
+def main():
+    """Main function"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Extract and Categorize Pipeline')
+    parser.add_argument('--output-dir', type=str, default=None,
+                       help='Output directory for CSV files (default: Service_Catalog/output)')
+    parser.add_argument('--max-workers', type=int, default=50,
+                       help='Number of parallel workers for GPT (default: 50)')
+    parser.add_argument('--cluster-method', type=str, default='gpt',
+                       choices=['gpt', 'rapidfuzz', 'both'],
+                       help='Clustering method (default: gpt)')
+    
+    args = parser.parse_args()
+    
+    # Initialize and run pipeline
+    pipeline = ExtractAndCategorize(output_dir=args.output_dir)
+    result = pipeline.run(max_workers=args.max_workers, cluster_method=args.cluster_method)
+    
+    if result:
+        print(f"\n✅ Success! Categorized data saved to: {result}")
+    else:
+        print("\n❌ Pipeline failed")
+        sys.exit(1)
 
-# ========== STEP 2: Save to XLSX first ==========
-print("\n🔷 STEP 2: Save raw XLSX")
-print("-" * 40)
 
-temp_file = "temp_convert.xlsx"
-print(f"💾 Saving to: {temp_file}")
-df.to_excel(temp_file, index=False, engine='openpyxl')
-print("   ✅ Saved!")
-
-# ========== STEP 3: Read XLSX and filter ==========
-print("\n🔷 STEP 3: Read XLSX & Filter INC")
-print("-" * 40)
-
-print(f"📖 Reading: {temp_file}")
-df2 = pd.read_excel(temp_file, engine='openpyxl')
-print(f"   Loaded {len(df2):,} rows")
-
-# Filter INC
-if 'incident_number' in df2.columns:
-    before = len(df2)
-    mask = df2['incident_number'].astype(str).str.startswith('INC')
-    df2 = df2[mask].copy()
-    print(f"🔍 Filtered: {before - len(df2):,} non-INC removed")
-    print(f"   Remaining: {len(df2):,}")
-
-# ========== STEP 4: Save final ==========
-print("\n🔷 STEP 4: Save Final XLSX")
-print("-" * 40)
-
-print(f"💾 Saving to: {output_file}")
-df2.to_excel(output_file, index=False, engine='openpyxl')
-print("   ✅ Saved!")
-
-# Cleanup
-os.remove(temp_file)
-print("   🗑️ Temp file removed")
-
-print("\n" + "=" * 60)
-print(f"✅ DONE! Final: {len(df2):,} rows")
-print(f"   Open {output_file} in Excel!")
+if __name__ == "__main__":
+    main()
