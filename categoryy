@@ -1,116 +1,60 @@
 #!/usr/bin/env python3
 """
-CSV Cleaner Script
-Removes rows where Cluster Group is empty.
-
-Usage:
-    python clean_csv.py input.csv output.csv
+Search for a specific value in CSV and display full row details
 """
 
 import pandas as pd
-import argparse
 import sys
-from pathlib import Path
 
+# Load CSV
+csv_file = "./output/incidents_categorized_20260117_042526.csv"
+search_value = "d-3735"
 
-def main():
-    parser = argparse.ArgumentParser(description='Clean CSV - Remove rows with empty Cluster Group')
-    parser.add_argument('input_csv', help='Path to input CSV file')
-    parser.add_argument('output_csv', help='Path to output CSV file')
+print(f"🔍 Searching for '{search_value}' in {csv_file}...")
+print("=" * 80)
+
+df = pd.read_csv(csv_file, low_memory=False)
+print(f"Loaded {len(df):,} rows, {len(df.columns)} columns\n")
+
+# Search in incident_number column
+if 'incident_number' in df.columns:
+    matches = df[df['incident_number'].astype(str).str.contains(search_value, case=False, na=False)]
     
-    args = parser.parse_args()
-    
-    # Check input file exists
-    input_path = Path(args.input_csv)
-    if not input_path.exists():
-        print(f"❌ Error: Input file not found: {args.input_csv}")
-        sys.exit(1)
-    
-    print("=" * 60)
-    print("🧹 CSV CLEANER - Remove Empty Cluster Group")
-    print("=" * 60)
-    print(f"📂 Input:  {args.input_csv}")
-    print(f"📂 Output: {args.output_csv}")
-    print("")
-    
-    # Load CSV
-    print("📖 Loading CSV...")
-    try:
-        df = pd.read_csv(args.input_csv, low_memory=False)
-        initial_rows = len(df)
-        print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
-    except Exception as e:
-        print(f"❌ Error loading CSV: {e}")
-        sys.exit(1)
-    
-    # Find Cluster Group column (handle different naming)
-    cluster_col = None
-    if 'Cluster Group' in df.columns:
-        cluster_col = 'Cluster Group'
-    elif 'cluster_group' in df.columns:
-        cluster_col = 'cluster_group'
-    elif 'CLUSTER_GROUP' in df.columns:
-        cluster_col = 'CLUSTER_GROUP'
-    
-    if not cluster_col:
-        print(f"❌ Error: 'Cluster Group' column not found!")
-        print(f"   Available columns: {df.columns.tolist()}")
-        sys.exit(1)
-    
-    # DEBUG: Check for garbage incident numbers and their Cluster Group values
-    print(f"\n🔍 DEBUG: Checking for invalid incident_number rows...")
-    if 'incident_number' in df.columns:
-        # Find rows that don't start with INC
-        def is_invalid_incident(val):
-            if pd.isna(val):
-                return True
-            s = str(val).strip()
-            return not (s.startswith('INC1') or s.startswith('INC2'))
+    if len(matches) > 0:
+        print(f"✅ Found {len(matches)} row(s) matching '{search_value}':\n")
         
-        invalid_mask = df['incident_number'].apply(is_invalid_incident)
-        invalid_rows = df[invalid_mask]
-        
-        if len(invalid_rows) > 0:
-            print(f"   Found {len(invalid_rows):,} rows with invalid incident_number")
-            print(f"   Sample invalid incident_numbers: {invalid_rows['incident_number'].head(5).tolist()}")
-            print(f"   Their Cluster Group values: {invalid_rows[cluster_col].head(5).tolist()}")
-            
-            # Remove these invalid rows
-            df = df[~invalid_mask].copy()
-            print(f"   ✅ Removed {len(invalid_rows):,} invalid rows")
-        else:
-            print(f"   All incident_numbers are valid (start with INC1 or INC2)")
-    
-    # STEP 2: Remove rows where Cluster Group is empty
-    print(f"\n🔍 Removing rows where '{cluster_col}' is empty...")
-    
-    # Remove rows where Cluster Group is empty (NaN or empty string)
-    mask = df[cluster_col].notna() & (df[cluster_col].astype(str).str.strip() != '')
-    df_cleaned = df[mask].copy()
-    
-    rows_removed_cluster = len(df) - len(df_cleaned)
-    print(f"   ✅ Removed {rows_removed_cluster:,} rows with empty Cluster Group")
-    
-    total_removed = initial_rows - len(df_cleaned)
-    
-    # Save output
-    print(f"\n💾 Saving cleaned CSV...")
-    try:
-        df_cleaned.to_csv(args.output_csv, index=False, encoding='utf-8')
-        print(f"   ✅ Saved to: {args.output_csv}")
-    except Exception as e:
-        print(f"❌ Error saving CSV: {e}")
-        sys.exit(1)
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("📊 SUMMARY")
-    print("=" * 60)
-    print(f"   Original rows:  {initial_rows:,}")
-    print(f"   Rows removed:   {total_removed:,}")
-    print(f"   Final rows:     {len(df_cleaned):,}")
-    print("✅ Done!")
+        for idx, row in matches.iterrows():
+            print(f"Row Index: {idx}")
+            print("-" * 60)
+            for col in df.columns:
+                val = row[col]
+                # Show if empty
+                if pd.isna(val):
+                    val_display = "<<< EMPTY (NaN) >>>"
+                elif str(val).strip() == "":
+                    val_display = "<<< EMPTY (blank) >>>"
+                else:
+                    val_display = str(val)[:100]  # Truncate long values
+                print(f"  {col}: {val_display}")
+            print("\n")
+    else:
+        print(f"❌ No rows found with incident_number containing '{search_value}'")
+else:
+    print("❌ 'incident_number' column not found")
 
+# Also search in ALL columns
+print("\n" + "=" * 80)
+print(f"🔍 Searching '{search_value}' in ALL columns...")
 
-if __name__ == "__main__":
-    main()
+found_in_cols = []
+for col in df.columns:
+    matches = df[df[col].astype(str).str.contains(search_value, case=False, na=False)]
+    if len(matches) > 0:
+        found_in_cols.append((col, len(matches)))
+
+if found_in_cols:
+    print(f"Found in columns:")
+    for col, count in found_in_cols:
+        print(f"  - {col}: {count} rows")
+else:
+    print(f"❌ '{search_value}' not found in any column")
