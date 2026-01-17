@@ -1,60 +1,69 @@
 #!/usr/bin/env python3
 """
-Search for a specific value in CSV and display full row details
+AGGRESSIVE CSV Cleaner
+Keeps ONLY rows where incident_number starts with 'INC'
 """
 
 import pandas as pd
 import sys
 
+if len(sys.argv) < 3:
+    print("Usage: python clean_csv.py input.csv output.csv")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+
+print("=" * 60)
+print("🧹 AGGRESSIVE CSV CLEANER")
+print("=" * 60)
+print(f"Input:  {input_file}")
+print(f"Output: {output_file}")
+
 # Load CSV
-csv_file = "./output/incidents_categorized_20260117_042526.csv"
-search_value = "d-3735"
+print("\n📖 Loading CSV...")
+df = pd.read_csv(input_file, low_memory=False)
+initial_rows = len(df)
+print(f"   Loaded {initial_rows:,} rows")
 
-print(f"🔍 Searching for '{search_value}' in {csv_file}...")
-print("=" * 80)
+# Show sample of incident_number values
+print(f"\n🔍 Sample incident_number values:")
+print(f"   First 5: {df['incident_number'].head(5).tolist()}")
+print(f"   Last 5:  {df['incident_number'].tail(5).tolist()}")
 
-df = pd.read_csv(csv_file, low_memory=False)
-print(f"Loaded {len(df):,} rows, {len(df.columns)} columns\n")
+# FILTER: Keep ONLY rows where incident_number starts with 'INC'
+print(f"\n🔍 Filtering: Keep only rows where incident_number starts with 'INC'...")
 
-# Search in incident_number column
-if 'incident_number' in df.columns:
-    matches = df[df['incident_number'].astype(str).str.contains(search_value, case=False, na=False)]
-    
-    if len(matches) > 0:
-        print(f"✅ Found {len(matches)} row(s) matching '{search_value}':\n")
-        
-        for idx, row in matches.iterrows():
-            print(f"Row Index: {idx}")
-            print("-" * 60)
-            for col in df.columns:
-                val = row[col]
-                # Show if empty
-                if pd.isna(val):
-                    val_display = "<<< EMPTY (NaN) >>>"
-                elif str(val).strip() == "":
-                    val_display = "<<< EMPTY (blank) >>>"
-                else:
-                    val_display = str(val)[:100]  # Truncate long values
-                print(f"  {col}: {val_display}")
-            print("\n")
-    else:
-        print(f"❌ No rows found with incident_number containing '{search_value}'")
-else:
-    print("❌ 'incident_number' column not found")
+def is_valid(val):
+    if pd.isna(val):
+        return False
+    return str(val).strip().startswith('INC')
 
-# Also search in ALL columns
-print("\n" + "=" * 80)
-print(f"🔍 Searching '{search_value}' in ALL columns...")
+# Count invalid BEFORE filtering
+invalid_count = (~df['incident_number'].apply(is_valid)).sum()
+print(f"   Found {invalid_count:,} INVALID rows (don't start with 'INC')")
 
-found_in_cols = []
-for col in df.columns:
-    matches = df[df[col].astype(str).str.contains(search_value, case=False, na=False)]
-    if len(matches) > 0:
-        found_in_cols.append((col, len(matches)))
+# Show examples of invalid rows
+invalid_rows = df[~df['incident_number'].apply(is_valid)]
+if len(invalid_rows) > 0:
+    print(f"   Examples of invalid incident_numbers:")
+    for val in invalid_rows['incident_number'].head(10).tolist():
+        print(f"      - {str(val)[:80]}...")
 
-if found_in_cols:
-    print(f"Found in columns:")
-    for col, count in found_in_cols:
-        print(f"  - {col}: {count} rows")
-else:
-    print(f"❌ '{search_value}' not found in any column")
+# KEEP only valid rows
+df_clean = df[df['incident_number'].apply(is_valid)].copy()
+
+print(f"\n✅ Kept {len(df_clean):,} valid rows")
+print(f"   Removed {initial_rows - len(df_clean):,} garbage rows")
+
+# Save
+print(f"\n💾 Saving to {output_file}...")
+df_clean.to_csv(output_file, index=False)
+
+print("\n" + "=" * 60)
+print("📊 SUMMARY")
+print("=" * 60)
+print(f"   Original:  {initial_rows:,}")
+print(f"   Removed:   {initial_rows - len(df_clean):,}")
+print(f"   Final:     {len(df_clean):,}")
+print("✅ DONE!")
