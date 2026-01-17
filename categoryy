@@ -1,109 +1,77 @@
 #!/usr/bin/env python3
 """
-Fix CSV - Remove newlines from inside cell values
-This fixes the Excel vs Python parsing difference
+CSV to Excel - Two-step approach:
+1. First convert CSV to XLSX (raw)
+2. Then read XLSX, filter INC rows, save cleaned XLSX
 """
 
-import csv
+import pandas as pd
 import sys
-import re
+import os
 
 if len(sys.argv) < 3:
-    print("Usage: python fix_csv.py input.csv output.csv")
+    print("Usage: python to_excel.py input.csv output.xlsx")
     sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🔧 FIX CSV - REMOVE EMBEDDED NEWLINES")
+print("📊 CSV TO EXCEL (TWO-STEP APPROACH)")
 print("=" * 60)
-print(f"Input:  {input_file}")
-print(f"Output: {output_file}")
 
-# Read with csv module
-print("\n📖 Reading CSV...")
-with open(input_file, 'r', encoding='utf-8', errors='replace', newline='') as f:
-    reader = csv.reader(f)
-    all_rows = list(reader)
+# ========== STEP 1: Convert CSV to XLSX (raw) ==========
+print("\n" + "=" * 40)
+print("STEP 1: Convert CSV to XLSX (raw)")
+print("=" * 40)
 
-total_rows = len(all_rows)
-print(f"   Rows read: {total_rows:,}")
+temp_xlsx = "temp_raw.xlsx"
 
-# Clean each cell - remove newlines and garbage
-print("\n🧹 Cleaning cells...")
-cleaned_rows = []
-cells_cleaned = 0
+print(f"\n📖 Reading CSV: {input_file}")
+df = pd.read_csv(input_file, low_memory=False)
+print(f"   Loaded {len(df):,} rows")
 
-for row in all_rows:
-    cleaned_row = []
-    for cell in row:
-        original = cell
-        # Remove embedded newlines
-        cleaned = cell.replace('\n', ' ').replace('\r', ' ')
-        # Remove multiple spaces
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        
-        if cleaned != original:
-            cells_cleaned += 1
-        
-        cleaned_row.append(cleaned)
-    cleaned_rows.append(cleaned_row)
+print(f"\n💾 Saving to temp XLSX: {temp_xlsx}")
+df.to_excel(temp_xlsx, index=False, engine='openpyxl')
+print(f"   ✅ Saved!")
 
-print(f"   Cells with newlines removed: {cells_cleaned:,}")
+# ========== STEP 2: Read XLSX, filter, save ==========
+print("\n" + "=" * 40)
+print("STEP 2: Read XLSX, filter INC rows, save")
+print("=" * 40)
 
-# Also filter valid rows (INC + non-blank CG)
-print("\n🔍 Filtering valid rows...")
-header = cleaned_rows[0]
+print(f"\n📖 Reading XLSX: {temp_xlsx}")
+df2 = pd.read_excel(temp_xlsx, engine='openpyxl')
+print(f"   Loaded {len(df2):,} rows")
 
-# Find column indices
-inc_idx = None
-cg_idx = None
-for i, col in enumerate(header):
-    if 'incident_number' in col.lower():
-        inc_idx = i
-    if 'cluster' in col.lower():
-        cg_idx = i
+# Filter: Keep only rows where incident_number starts with 'INC'
+print("\n🔍 Filtering: Keep only INC rows...")
+if 'incident_number' in df2.columns:
+    initial = len(df2)
+    mask = df2['incident_number'].astype(str).str.startswith('INC')
+    df2 = df2[mask].copy()
+    removed = initial - len(df2)
+    print(f"   Removed {removed:,} non-INC rows")
+    print(f"   Remaining: {len(df2):,}")
 
-print(f"   incident_number: column {inc_idx}")
-print(f"   Cluster Group: column {cg_idx}")
+# Clean newlines
+print("\n🧹 Cleaning newlines...")
+for col in df2.columns:
+    if df2[col].dtype == 'object':
+        df2[col] = df2[col].astype(str).str.replace('\n', ' ', regex=False)
+        df2[col] = df2[col].astype(str).str.replace('\r', ' ', regex=False)
 
-valid_rows = [header]
-removed_inc = 0
-removed_cg = 0
+# Save final
+print(f"\n💾 Saving final XLSX: {output_file}")
+df2.to_excel(output_file, index=False, engine='openpyxl')
+print(f"   ✅ Saved!")
 
-for row in cleaned_rows[1:]:
-    if len(row) <= max(inc_idx or 0, cg_idx or 0):
-        removed_inc += 1
-        continue
-    
-    # Check INC
-    inc_val = row[inc_idx].strip() if inc_idx is not None else ''
-    if not inc_val.startswith('INC'):
-        removed_inc += 1
-        continue
-    
-    # Check CG
-    cg_val = row[cg_idx].strip() if cg_idx is not None else ''
-    if cg_val == '' or cg_val.lower() == 'nan':
-        removed_cg += 1
-        continue
-    
-    valid_rows.append(row)
-
-print(f"   Removed (no INC): {removed_inc:,}")
-print(f"   Removed (blank CG): {removed_cg:,}")
-
-# Save
-print(f"\n💾 Saving to {output_file}...")
-with open(output_file, 'w', encoding='utf-8', newline='') as f:
-    writer = csv.writer(f, quoting=csv.QUOTE_ALL)  # Quote all fields to prevent issues
-    writer.writerows(valid_rows)
+# Cleanup temp file
+os.remove(temp_xlsx)
+print(f"   🗑️ Removed temp file")
 
 print("\n" + "=" * 60)
-print("📊 SUMMARY")
+print("📊 FINAL SUMMARY")
 print("=" * 60)
-print(f"   Original rows: {total_rows:,}")
-print(f"   Cells cleaned: {cells_cleaned:,}")
-print(f"   Final rows:    {len(valid_rows):,}")
-print("\n✅ Open this in Excel - should be clean now!")
+print(f"   Final rows: {len(df2):,}")
+print(f"\n✅ Open {output_file} in Excel!")
