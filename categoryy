@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 CSV Cleaner Script
-Removes rows with empty/null values from a CSV file.
+Removes rows where Cluster Group is empty.
 
 Usage:
     python clean_csv.py input.csv output.csv
-    python clean_csv.py input.csv output.csv --threshold 0
-    python clean_csv.py input.csv output.csv --columns incident_number opened_at short_description
 """
 
 import pandas as pd
@@ -15,111 +13,10 @@ import sys
 from pathlib import Path
 
 
-def remove_empty_rows(df, check_columns=None, threshold=3, check_all=False):
-    """
-    Remove rows with too many empty cells (NaNs or empty strings).
-    
-    Args:
-        df (pd.DataFrame): The input DataFrame.
-        check_columns (list): List of column names to check.
-        threshold (int): Maximum allowed empty cells before a row is removed.
-        check_all (bool): If True, checks all columns in the DataFrame.
-        
-    Returns:
-        tuple: (cleaned DataFrame, number of rows removed)
-    """
-    
-    # Initial check: if no columns are specified and check_all is False, do nothing
-    if not check_all and not check_columns:
-        return df, 0
-
-    initial_rows = len(df)
-
-    # Determine columns to check
-    if check_all:
-        cols_to_check = df.columns.tolist()
-    else:
-        cols_to_check = []
-        for col in check_columns:
-            if col in df.columns:
-                cols_to_check.append(col)
-            # Handle 1-based integer indexing for columns
-            elif isinstance(col, int) and 0 < col <= len(df.columns):
-                cols_to_check.append(df.columns[col - 1])
-
-    # If no valid columns were found, return the original dataframe
-    if not cols_to_check:
-        print(f"⚠️ Warning: None of the specified columns were found in the CSV")
-        print(f"   Available columns: {df.columns.tolist()}")
-        return df, 0
-
-    print(f"   Checking columns: {cols_to_check}")
-
-    # 1. Count NaN values across the specified columns (axis=1 is row-wise)
-    empty_count = df[cols_to_check].isna().sum(axis=1)
-
-    # 2. Count empty or whitespace-only strings
-    for col in cols_to_check:
-        if df[col].dtype == "object":
-            # Adds 1 to the count if the value is a string and is empty after stripping
-            empty_count += df[col].apply(
-                lambda x: 1 if isinstance(x, str) and x.strip() == "" else 0
-            )
-
-    # Remove rows where the total empty count exceeds the threshold
-    df_cleaned = df[empty_count <= threshold].copy()
-    
-    rows_removed = initial_rows - len(df_cleaned)
-
-    return df_cleaned, rows_removed
-
-
-def remove_invalid_incidents(df):
-    """
-    Remove rows where incident_number doesn't start with INC1 or INC2.
-    """
-    if 'incident_number' not in df.columns:
-        return df, 0
-    
-    initial_rows = len(df)
-    
-    def is_valid_incident(val):
-        if pd.isna(val):
-            return False
-        s = str(val).strip()
-        return s.startswith('INC1') or s.startswith('INC2')
-    
-    valid_mask = df['incident_number'].apply(is_valid_incident)
-    df_cleaned = df[valid_mask].copy()
-    
-    rows_removed = initial_rows - len(df_cleaned)
-    return df_cleaned, rows_removed
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Clean CSV file by removing rows with empty values',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python clean_csv.py input.csv output.csv
-  python clean_csv.py input.csv output.csv --threshold 0
-  python clean_csv.py input.csv output.csv --columns incident_number opened_at short_description
-  python clean_csv.py input.csv output.csv --check-all --threshold 5
-        """
-    )
-    
+    parser = argparse.ArgumentParser(description='Clean CSV - Remove rows with empty Cluster Group')
     parser.add_argument('input_csv', help='Path to input CSV file')
     parser.add_argument('output_csv', help='Path to output CSV file')
-    parser.add_argument('--columns', nargs='+', 
-                        default=['incident_number', 'opened_at', 'short_description'],
-                        help='Columns to check for empty values (default: incident_number opened_at short_description)')
-    parser.add_argument('--threshold', type=int, default=0,
-                        help='Maximum allowed empty cells per row (default: 0 = no empty cells allowed)')
-    parser.add_argument('--check-all', action='store_true',
-                        help='Check all columns instead of specified ones')
-    parser.add_argument('--validate-inc', action='store_true', default=True,
-                        help='Remove rows where incident_number does not start with INC1 or INC2 (default: True)')
     
     args = parser.parse_args()
     
@@ -130,55 +27,50 @@ Examples:
         sys.exit(1)
     
     print("=" * 60)
-    print("🧹 CSV CLEANER")
+    print("🧹 CSV CLEANER - Remove Empty Cluster Group")
     print("=" * 60)
     print(f"📂 Input:  {args.input_csv}")
     print(f"📂 Output: {args.output_csv}")
-    print(f"📋 Columns to check: {args.columns if not args.check_all else 'ALL'}")
-    print(f"🔢 Threshold: {args.threshold} (max empty cells allowed)")
     print("")
     
     # Load CSV
     print("📖 Loading CSV...")
     try:
         df = pd.read_csv(args.input_csv)
-        print(f"   Loaded {len(df):,} rows, {len(df.columns)} columns")
+        initial_rows = len(df)
+        print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
     except Exception as e:
         print(f"❌ Error loading CSV: {e}")
         sys.exit(1)
     
-    total_removed = 0
+    # Find Cluster Group column (handle different naming)
+    cluster_col = None
+    if 'Cluster Group' in df.columns:
+        cluster_col = 'Cluster Group'
+    elif 'cluster_group' in df.columns:
+        cluster_col = 'cluster_group'
+    elif 'CLUSTER_GROUP' in df.columns:
+        cluster_col = 'CLUSTER_GROUP'
     
-    # Step 1: Remove rows with invalid incident_number (INC1/INC2 check)
-    if args.validate_inc:
-        print("\n🔍 Step 1: Validating incident_number (INC1/INC2)...")
-        df, removed = remove_invalid_incidents(df)
-        if removed > 0:
-            print(f"   ✅ Removed {removed:,} rows with invalid incident_number")
-        else:
-            print(f"   ✅ All incident numbers are valid")
-        total_removed += removed
+    if not cluster_col:
+        print(f"❌ Error: 'Cluster Group' column not found!")
+        print(f"   Available columns: {df.columns.tolist()}")
+        sys.exit(1)
     
-    # Step 2: Remove rows with empty values
-    print(f"\n🔍 Step 2: Checking for empty values (threshold: {args.threshold})...")
-    df, removed = remove_empty_rows(
-        df, 
-        check_columns=args.columns if not args.check_all else None,
-        threshold=args.threshold,
-        check_all=args.check_all
-    )
-    if removed > 0:
-        print(f"   ✅ Removed {removed:,} rows with too many empty values")
-    else:
-        print(f"   ✅ No rows exceeded the empty threshold")
-    total_removed += removed
+    print(f"\n🔍 Removing rows where '{cluster_col}' is empty...")
+    
+    # Remove rows where Cluster Group is empty (NaN or empty string)
+    mask = df[cluster_col].notna() & (df[cluster_col].astype(str).str.strip() != '')
+    df_cleaned = df[mask].copy()
+    
+    rows_removed = initial_rows - len(df_cleaned)
+    print(f"   ✅ Removed {rows_removed:,} rows with empty Cluster Group")
     
     # Save output
     print(f"\n💾 Saving cleaned CSV...")
     try:
-        df.to_csv(args.output_csv, index=False, encoding='utf-8')
+        df_cleaned.to_csv(args.output_csv, index=False, encoding='utf-8')
         print(f"   ✅ Saved to: {args.output_csv}")
-        print(f"   📊 Final row count: {len(df):,}")
     except Exception as e:
         print(f"❌ Error saving CSV: {e}")
         sys.exit(1)
@@ -187,9 +79,9 @@ Examples:
     print("\n" + "=" * 60)
     print("📊 SUMMARY")
     print("=" * 60)
-    print(f"   Original rows:  {len(df) + total_removed:,}")
-    print(f"   Rows removed:   {total_removed:,}")
-    print(f"   Final rows:     {len(df):,}")
+    print(f"   Original rows:  {initial_rows:,}")
+    print(f"   Rows removed:   {rows_removed:,}")
+    print(f"   Final rows:     {len(df_cleaned):,}")
     print("✅ Done!")
 
 
