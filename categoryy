@@ -1,37 +1,23 @@
 #!/usr/bin/env python3
 """
-CSV Cleaner - Uses pandas to properly parse CSV
-Removes rows where opened_at is blank or not a valid datetime
+CSV Cleaner - Removes rows where cleaned_description is empty
 """
 
 import pandas as pd
 import sys
-import re
 
 if len(sys.argv) < 3:
-    print("Usage: python clean_csv_datetime.py input.csv output.csv")
+    print("Usage: python clean_csv_final.py input.csv output.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🧹 CSV CLEANER (opened_at datetime validation)")
+print("🧹 CSV CLEANER (cleaned_description validation)")
 print("=" * 60)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
-
-# Datetime pattern: YYYY-MM-DD
-datetime_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}')
-
-def is_valid_datetime(value):
-    """Check if value looks like a datetime"""
-    if pd.isna(value):
-        return False
-    val_str = str(value).strip()
-    if val_str == '' or val_str == 'nan':
-        return False
-    return bool(datetime_pattern.match(val_str))
 
 # Read CSV with pandas
 print("\n📖 Loading CSV with pandas...")
@@ -39,44 +25,41 @@ df = pd.read_csv(input_file, low_memory=False)
 initial_rows = len(df)
 print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
 
-# Check if opened_at column exists
-if 'opened_at' not in df.columns:
-    print("❌ ERROR: 'opened_at' column not found!")
+# Check if cleaned_description column exists
+if 'cleaned_description' not in df.columns:
+    print("❌ ERROR: 'cleaned_description' column not found!")
     print(f"   Available columns: {df.columns.tolist()[:10]}...")
     sys.exit(1)
 
-print(f"\n🔍 Checking 'opened_at' column...")
+print(f"\n🔍 Checking 'cleaned_description' column...")
 
 # Show sample values
-print("\n   First 5 opened_at values:")
-for idx, val in df['opened_at'].head(5).items():
-    valid = "✅" if is_valid_datetime(val) else "❌"
-    print(f"      Row {idx}: '{str(val)[:40]}' {valid}")
+print("\n   First 5 cleaned_description values:")
+for idx, val in df['cleaned_description'].head(5).items():
+    is_empty = pd.isna(val) or str(val).strip() == ''
+    status = "❌ EMPTY" if is_empty else "✅ OK"
+    print(f"      Row {idx}: '{str(val)[:40]}...' {status}")
 
-print("\n   Last 5 opened_at values:")
-for idx, val in df['opened_at'].tail(5).items():
-    valid = "✅" if is_valid_datetime(val) else "❌"
-    print(f"      Row {idx}: '{str(val)[:40]}' {valid}")
-
-# Filter: Keep only rows with valid datetime in opened_at
+# Filter: Keep only rows where cleaned_description is NOT empty
 print(f"\n🔍 Filtering rows...")
-valid_mask = df['opened_at'].apply(is_valid_datetime)
+
+# Create mask for valid rows (not NaN and not empty string)
+valid_mask = df['cleaned_description'].notna() & (df['cleaned_description'].astype(str).str.strip() != '')
 df_clean = df[valid_mask].copy()
 
 invalid_count = initial_rows - len(df_clean)
 
 if invalid_count > 0:
-    print(f"\n❌ Found {invalid_count:,} INVALID rows")
+    print(f"\n❌ Found {invalid_count:,} rows with EMPTY cleaned_description")
     
-    # Show examples
+    # Show examples with incident_number
     invalid_df = df[~valid_mask]
-    print("\n   Examples of invalid rows:")
-    for idx in invalid_df.head(10).index:
+    print("\n   Examples of incident_number values being removed:")
+    for idx in invalid_df.head(20).index:
         inc_num = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
-        opened_val = df.loc[idx, 'opened_at']
-        print(f"      Row {idx}: incident='{str(inc_num)[:30]}', opened_at='{str(opened_val)[:30]}'")
+        print(f"      Row {idx}: '{str(inc_num)[:60]}'")
 else:
-    print(f"\n✅ All rows have valid opened_at values")
+    print(f"\n✅ All rows have valid cleaned_description values")
 
 print(f"\n✅ Valid rows: {len(df_clean):,}")
 
