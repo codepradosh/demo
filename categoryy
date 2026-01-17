@@ -1,69 +1,78 @@
 #!/usr/bin/env python3
 """
-AGGRESSIVE CSV Cleaner
-Keeps ONLY rows where incident_number starts with 'INC'
+RAW CSV Cleaner - Reads file as text, not pandas
 """
 
-import pandas as pd
 import sys
 
 if len(sys.argv) < 3:
-    print("Usage: python clean_csv.py input.csv output.csv")
+    print("Usage: python clean_raw.py input.csv output.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🧹 AGGRESSIVE CSV CLEANER")
+print("🧹 RAW CSV CLEANER (Text-based)")
 print("=" * 60)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
 
-# Load CSV
-print("\n📖 Loading CSV...")
-df = pd.read_csv(input_file, low_memory=False)
-initial_rows = len(df)
-print(f"   Loaded {initial_rows:,} rows")
+# Read as raw text
+print("\n📖 Reading file as raw text...")
+with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
+    lines = f.readlines()
 
-# Show sample of incident_number values
-print(f"\n🔍 Sample incident_number values:")
-print(f"   First 5: {df['incident_number'].head(5).tolist()}")
-print(f"   Last 5:  {df['incident_number'].tail(5).tolist()}")
+total_lines = len(lines)
+print(f"   Total lines: {total_lines:,}")
 
-# FILTER: Keep ONLY rows where incident_number starts with 'INC'
-print(f"\n🔍 Filtering: Keep only rows where incident_number starts with 'INC'...")
+# Show first 10 lines
+print("\n🔍 First 10 lines:")
+for i, line in enumerate(lines[:10]):
+    print(f"   Line {i}: {line[:80].strip()}...")
 
-def is_valid(val):
-    if pd.isna(val):
-        return False
-    return str(val).strip().startswith('INC')
+# Show last 10 lines
+print("\n🔍 Last 10 lines:")
+for i, line in enumerate(lines[-10:], start=total_lines-10):
+    print(f"   Line {i}: {line[:80].strip()}...")
 
-# Count invalid BEFORE filtering
-invalid_count = (~df['incident_number'].apply(is_valid)).sum()
-print(f"   Found {invalid_count:,} INVALID rows (don't start with 'INC')")
+# Keep only lines that start with "INC" (after the header)
+print("\n🔍 Filtering lines...")
 
-# Show examples of invalid rows
-invalid_rows = df[~df['incident_number'].apply(is_valid)]
-if len(invalid_rows) > 0:
-    print(f"   Examples of invalid incident_numbers:")
-    for val in invalid_rows['incident_number'].head(10).tolist():
-        print(f"      - {str(val)[:80]}...")
+header = lines[0]  # Keep header
+valid_lines = [header]
+invalid_count = 0
+invalid_examples = []
 
-# KEEP only valid rows
-df_clean = df[df['incident_number'].apply(is_valid)].copy()
+for i, line in enumerate(lines[1:], start=1):
+    # Get first field (before first comma)
+    first_field = line.split(',')[0].strip()
+    
+    # Check if it starts with INC
+    if first_field.startswith('INC'):
+        valid_lines.append(line)
+    else:
+        invalid_count += 1
+        if len(invalid_examples) < 20:
+            invalid_examples.append(f"Line {i}: {first_field[:60]}")
 
-print(f"\n✅ Kept {len(df_clean):,} valid rows")
-print(f"   Removed {initial_rows - len(df_clean):,} garbage rows")
+print(f"\n❌ Found {invalid_count:,} INVALID lines")
+if invalid_examples:
+    print("   Examples of invalid first fields:")
+    for ex in invalid_examples:
+        print(f"      {ex}")
 
-# Save
+print(f"\n✅ Valid lines: {len(valid_lines):,} (including header)")
+
+# Write output
 print(f"\n💾 Saving to {output_file}...")
-df_clean.to_csv(output_file, index=False)
+with open(output_file, 'w', encoding='utf-8') as f:
+    f.writelines(valid_lines)
 
 print("\n" + "=" * 60)
 print("📊 SUMMARY")
 print("=" * 60)
-print(f"   Original:  {initial_rows:,}")
-print(f"   Removed:   {initial_rows - len(df_clean):,}")
-print(f"   Final:     {len(df_clean):,}")
+print(f"   Original lines: {total_lines:,}")
+print(f"   Invalid removed: {invalid_count:,}")
+print(f"   Final lines: {len(valid_lines):,}")
 print("✅ DONE!")
