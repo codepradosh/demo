@@ -1,125 +1,93 @@
 #!/usr/bin/env python3
 """
-RAW CSV Cleaner - Checks opened_at column for valid datetime
-Removes rows where opened_at is blank or not a datetime
+CSV Cleaner - Uses pandas to properly parse CSV
+Removes rows where opened_at is blank or not a valid datetime
 """
 
+import pandas as pd
 import sys
 import re
 
 if len(sys.argv) < 3:
-    print("Usage: python clean_raw.py input.csv output.csv")
+    print("Usage: python clean_csv_datetime.py input.csv output.csv")
     sys.exit(1)
 
 input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🧹 RAW CSV CLEANER (Check opened_at datetime)")
+print("🧹 CSV CLEANER (opened_at datetime validation)")
 print("=" * 60)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
 
-# Datetime pattern to match:
-# 2025-02-22 22:32:11+00:00
-# 2025-02-22T22:32:11.001+0000
-# Must start with YYYY-MM-DD
+# Datetime pattern: YYYY-MM-DD
 datetime_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}')
 
 def is_valid_datetime(value):
-    """Check if value looks like a datetime (starts with YYYY-MM-DD)"""
-    if not value or value.strip() == '':
+    """Check if value looks like a datetime"""
+    if pd.isna(value):
         return False
-    return bool(datetime_pattern.match(value.strip()))
+    val_str = str(value).strip()
+    if val_str == '' or val_str == 'nan':
+        return False
+    return bool(datetime_pattern.match(val_str))
 
-# Read as raw text
-print("\n📖 Reading file as raw text...")
-with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
-    lines = f.readlines()
+# Read CSV with pandas
+print("\n📖 Loading CSV with pandas...")
+df = pd.read_csv(input_file, low_memory=False)
+initial_rows = len(df)
+print(f"   Loaded {initial_rows:,} rows, {len(df.columns)} columns")
 
-total_lines = len(lines)
-print(f"   Total lines: {total_lines:,}")
-
-# Parse header to find opened_at column index
-header = lines[0]
-header_fields = header.strip().split(',')
-print(f"\n🔍 Header columns: {len(header_fields)}")
-
-# Find opened_at column
-opened_at_idx = None
-for i, col in enumerate(header_fields):
-    if 'opened_at' in col.lower():
-        opened_at_idx = i
-        print(f"   Found 'opened_at' at column index {i} (column name: '{col}')")
-        break
-
-if opened_at_idx is None:
-    print("❌ ERROR: 'opened_at' column not found in header!")
-    print(f"   First 10 columns: {header_fields[:10]}")
+# Check if opened_at column exists
+if 'opened_at' not in df.columns:
+    print("❌ ERROR: 'opened_at' column not found!")
+    print(f"   Available columns: {df.columns.tolist()[:10]}...")
     sys.exit(1)
 
-# Show sample lines
-print("\n🔍 First 5 data lines (opened_at values):")
-for i, line in enumerate(lines[1:6], start=1):
-    fields = line.strip().split(',')
-    if len(fields) > opened_at_idx:
-        val = fields[opened_at_idx]
-        valid = "✅" if is_valid_datetime(val) else "❌"
-        print(f"   Line {i}: opened_at = '{val[:40]}' {valid}")
+print(f"\n🔍 Checking 'opened_at' column...")
 
-print("\n🔍 Last 5 data lines (opened_at values):")
-for i, line in enumerate(lines[-5:], start=total_lines-5):
-    fields = line.strip().split(',')
-    if len(fields) > opened_at_idx:
-        val = fields[opened_at_idx]
-        valid = "✅" if is_valid_datetime(val) else "❌"
-        print(f"   Line {i}: opened_at = '{val[:40]}' {valid}")
+# Show sample values
+print("\n   First 5 opened_at values:")
+for idx, val in df['opened_at'].head(5).items():
+    valid = "✅" if is_valid_datetime(val) else "❌"
+    print(f"      Row {idx}: '{str(val)[:40]}' {valid}")
 
-# Filter: Keep only lines where opened_at is a valid datetime
-print("\n🔍 Filtering lines based on opened_at column...")
+print("\n   Last 5 opened_at values:")
+for idx, val in df['opened_at'].tail(5).items():
+    valid = "✅" if is_valid_datetime(val) else "❌"
+    print(f"      Row {idx}: '{str(val)[:40]}' {valid}")
 
-valid_lines = [header]  # Keep header
-invalid_count = 0
-invalid_examples = []
+# Filter: Keep only rows with valid datetime in opened_at
+print(f"\n🔍 Filtering rows...")
+valid_mask = df['opened_at'].apply(is_valid_datetime)
+df_clean = df[valid_mask].copy()
 
-for i, line in enumerate(lines[1:], start=1):
-    fields = line.strip().split(',')
+invalid_count = initial_rows - len(df_clean)
+
+if invalid_count > 0:
+    print(f"\n❌ Found {invalid_count:,} INVALID rows")
     
-    # Get opened_at value
-    if len(fields) > opened_at_idx:
-        opened_at_value = fields[opened_at_idx].strip()
-        
-        if is_valid_datetime(opened_at_value):
-            valid_lines.append(line)
-        else:
-            invalid_count += 1
-            if len(invalid_examples) < 20:
-                # Also get incident_number for reference (assume it's column 0)
-                inc_num = fields[0][:30] if len(fields) > 0 else "N/A"
-                invalid_examples.append(f"Line {i}: incident='{inc_num}', opened_at='{opened_at_value[:30]}'")
-    else:
-        # Row has fewer columns than expected
-        invalid_count += 1
-        if len(invalid_examples) < 20:
-            invalid_examples.append(f"Line {i}: <missing columns>")
+    # Show examples
+    invalid_df = df[~valid_mask]
+    print("\n   Examples of invalid rows:")
+    for idx in invalid_df.head(10).index:
+        inc_num = df.loc[idx, 'incident_number'] if 'incident_number' in df.columns else 'N/A'
+        opened_val = df.loc[idx, 'opened_at']
+        print(f"      Row {idx}: incident='{str(inc_num)[:30]}', opened_at='{str(opened_val)[:30]}'")
+else:
+    print(f"\n✅ All rows have valid opened_at values")
 
-print(f"\n❌ Found {invalid_count:,} INVALID lines (missing/invalid datetime)")
-if invalid_examples:
-    print("   Examples:")
-    for ex in invalid_examples:
-        print(f"      {ex}")
+print(f"\n✅ Valid rows: {len(df_clean):,}")
 
-print(f"\n✅ Valid lines: {len(valid_lines):,} (including header)")
-
-# Write output
+# Save cleaned CSV
 print(f"\n💾 Saving to {output_file}...")
-with open(output_file, 'w', encoding='utf-8') as f:
-    f.writelines(valid_lines)
+df_clean.to_csv(output_file, index=False, encoding='utf-8')
 
 print("\n" + "=" * 60)
 print("📊 SUMMARY")
 print("=" * 60)
-print(f"   Original lines: {total_lines:,}")
+print(f"   Original rows:  {initial_rows:,}")
 print(f"   Invalid removed: {invalid_count:,}")
-print(f"   Final lines: {len(valid_lines):,}")
+print(f"   Final rows:     {len(df_clean):,}")
 print("✅ DONE!")
