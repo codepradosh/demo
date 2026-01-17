@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-RAW CSV Cleaner - Reads file as text, checks incident_number column
+RAW CSV Cleaner - Checks opened_at column for valid datetime
+Removes rows where opened_at is blank or not a datetime
 """
 
 import sys
+import re
 
 if len(sys.argv) < 3:
     print("Usage: python clean_raw.py input.csv output.csv")
@@ -13,10 +15,22 @@ input_file = sys.argv[1]
 output_file = sys.argv[2]
 
 print("=" * 60)
-print("🧹 RAW CSV CLEANER (Text-based)")
+print("🧹 RAW CSV CLEANER (Check opened_at datetime)")
 print("=" * 60)
 print(f"Input:  {input_file}")
 print(f"Output: {output_file}")
+
+# Datetime pattern to match:
+# 2025-02-22 22:32:11+00:00
+# 2025-02-22T22:32:11.001+0000
+# Must start with YYYY-MM-DD
+datetime_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}')
+
+def is_valid_datetime(value):
+    """Check if value looks like a datetime (starts with YYYY-MM-DD)"""
+    if not value or value.strip() == '':
+        return False
+    return bool(datetime_pattern.match(value.strip()))
 
 # Read as raw text
 print("\n📖 Reading file as raw text...")
@@ -26,41 +40,43 @@ with open(input_file, 'r', encoding='utf-8', errors='replace') as f:
 total_lines = len(lines)
 print(f"   Total lines: {total_lines:,}")
 
-# Parse header to find incident_number column index
+# Parse header to find opened_at column index
 header = lines[0]
 header_fields = header.strip().split(',')
 print(f"\n🔍 Header columns: {len(header_fields)}")
 
-# Find incident_number column
-incident_col_idx = None
+# Find opened_at column
+opened_at_idx = None
 for i, col in enumerate(header_fields):
-    if 'incident_number' in col.lower():
-        incident_col_idx = i
-        print(f"   Found 'incident_number' at column index {i} (column name: '{col}')")
+    if 'opened_at' in col.lower():
+        opened_at_idx = i
+        print(f"   Found 'opened_at' at column index {i} (column name: '{col}')")
         break
 
-if incident_col_idx is None:
-    print("❌ ERROR: 'incident_number' column not found in header!")
-    print(f"   Available columns: {header_fields[:10]}...")
+if opened_at_idx is None:
+    print("❌ ERROR: 'opened_at' column not found in header!")
+    print(f"   First 10 columns: {header_fields[:10]}")
     sys.exit(1)
 
 # Show sample lines
-print("\n🔍 First 5 data lines (incident_number values):")
+print("\n🔍 First 5 data lines (opened_at values):")
 for i, line in enumerate(lines[1:6], start=1):
     fields = line.strip().split(',')
-    if len(fields) > incident_col_idx:
-        inc_val = fields[incident_col_idx]
-        print(f"   Line {i}: incident_number = '{inc_val[:50]}'")
+    if len(fields) > opened_at_idx:
+        val = fields[opened_at_idx]
+        valid = "✅" if is_valid_datetime(val) else "❌"
+        print(f"   Line {i}: opened_at = '{val[:40]}' {valid}")
 
-print("\n🔍 Last 5 data lines (incident_number values):")
+print("\n🔍 Last 5 data lines (opened_at values):")
 for i, line in enumerate(lines[-5:], start=total_lines-5):
     fields = line.strip().split(',')
-    if len(fields) > incident_col_idx:
-        inc_val = fields[incident_col_idx]
-        print(f"   Line {i}: incident_number = '{inc_val[:50]}'")
+    if len(fields) > opened_at_idx:
+        val = fields[opened_at_idx]
+        valid = "✅" if is_valid_datetime(val) else "❌"
+        print(f"   Line {i}: opened_at = '{val[:40]}' {valid}")
 
-# Filter: Keep only lines where incident_number starts with 'INC'
-print("\n🔍 Filtering lines based on incident_number column...")
+# Filter: Keep only lines where opened_at is a valid datetime
+print("\n🔍 Filtering lines based on opened_at column...")
 
 valid_lines = [header]  # Keep header
 invalid_count = 0
@@ -69,25 +85,27 @@ invalid_examples = []
 for i, line in enumerate(lines[1:], start=1):
     fields = line.strip().split(',')
     
-    # Get incident_number value
-    if len(fields) > incident_col_idx:
-        inc_value = fields[incident_col_idx].strip()
+    # Get opened_at value
+    if len(fields) > opened_at_idx:
+        opened_at_value = fields[opened_at_idx].strip()
         
-        if inc_value.startswith('INC'):
+        if is_valid_datetime(opened_at_value):
             valid_lines.append(line)
         else:
             invalid_count += 1
             if len(invalid_examples) < 20:
-                invalid_examples.append(f"Line {i}: '{inc_value[:60]}'")
+                # Also get incident_number for reference (assume it's column 0)
+                inc_num = fields[0][:30] if len(fields) > 0 else "N/A"
+                invalid_examples.append(f"Line {i}: incident='{inc_num}', opened_at='{opened_at_value[:30]}'")
     else:
         # Row has fewer columns than expected
         invalid_count += 1
         if len(invalid_examples) < 20:
             invalid_examples.append(f"Line {i}: <missing columns>")
 
-print(f"\n❌ Found {invalid_count:,} INVALID lines")
+print(f"\n❌ Found {invalid_count:,} INVALID lines (missing/invalid datetime)")
 if invalid_examples:
-    print("   Examples of invalid incident_number values:")
+    print("   Examples:")
     for ex in invalid_examples:
         print(f"      {ex}")
 
