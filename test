@@ -288,12 +288,14 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         logging.info("📤 Pushing Incident CSV to PostgreSQL")
         logging.info("="*80)
         logging.info(f"   CSV file: {csv_file_path}")
+        logging.info(f"   File size: {os.path.getsize(csv_file_path) / (1024*1024):.2f} MB" if os.path.exists(csv_file_path) else "   File size: Unknown")
         logging.info(f"   Database: {database}")
         logging.info(f"   Table: {table_name}")
         logging.info(f"   Host: {host}:{port}")
         logging.info(f"   User: {user}")
         logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
         logging.info(f"   Create table: {create_table}")
+        logging.info(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logging.info("="*80)
         
         # Read CSV file
@@ -314,13 +316,24 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         gpn_columns = ['resolved_by_gpn', 'assigned_to_gpn', 'caller_gpn', 'u_manager_in_charge_gpn']
         for col in gpn_columns:
             if col in df.columns:
-                if df[col].dtype == 'float64':
-                    # Convert float to string, handling NaN
-                    df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
-                    logging.info(f"   ✓ Converted {col} from float64 to string")
-                elif df[col].dtype == 'object':
-                    # Already string, but ensure NaN handling
-                    df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
+                try:
+                    initial_dtype = df[col].dtype
+                    non_null_before = df[col].notna().sum()
+                    
+                    if df[col].dtype == 'float64':
+                        # Convert float to string, handling NaN
+                        df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
+                        non_null_after = df[col].notna().sum()
+                        logging.info(f"   ✓ Converted {col} from {initial_dtype} to string (non-null: {non_null_before} -> {non_null_after})")
+                    elif df[col].dtype == 'object':
+                        # Already string, but ensure NaN handling
+                        df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
+                        logging.info(f"   ✓ Cleaned {col} (already string, handled NaN)")
+                    else:
+                        logging.warning(f"   ⚠️  {col} has unexpected dtype: {initial_dtype}")
+                except Exception as e:
+                    logging.error(f"   ❌ Error converting {col}: {e}")
+                    logging.error(traceback.format_exc())
         
         # Custom date parsing function to handle various formats
         def parse_datetime_robust(series):
@@ -403,65 +416,118 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                              'resolved_by_user_name', 'resolved_by_gpn', 'sys_updated_by',
                              'u_manager_in_charge_user_name', 'u_manager_in_charge_gpn']
         
+        logging.info(f"\n⏳ Converting date columns to datetime...")
+        logging.info(f"   Excluding from date parsing: {len(exclude_from_dates)} columns")
+        
         date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
                         'created_on', 'updated_on', 'opened_date', 'closed_date']
+        date_conversion_stats = {'success': 0, 'partial': 0, 'failed': 0, 'skipped': 0}
+        
         for col in df.columns:
             # Skip excluded columns
             if col in exclude_from_dates:
+                date_conversion_stats['skipped'] += 1
+                logging.debug(f"   ⏭️  Skipped {col} (excluded from date parsing)")
                 continue
             # Only process date-like columns
             if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
                 if df[col].dtype == 'object':
                     try:
+                        initial_non_null = df[col].notna().sum()
                         df[col] = parse_datetime_robust(df[col])
                         # Check how many were successfully parsed
                         parsed_count = df[col].notna().sum()
                         total_count = len(df[col])
-                        if parsed_count < total_count:
+                        
+                        if parsed_count == 0 and initial_non_null > 0:
+                            date_conversion_stats['failed'] += 1
+                            logging.error(f"   ❌ {col}: Failed to parse any values (had {initial_non_null:,} non-null)")
+                            # Try basic conversion as fallback
+                            try:
+                                df[col] = pd.to_datetime(df[col], errors='coerce')
+                                retry_parsed = df[col].notna().sum()
+                                if retry_parsed > 0:
+                                    logging.info(f"      ✓ Fallback parsing succeeded: {retry_parsed:,} values")
+                            except Exception as fallback_error:
+                                logging.error(f"      ❌ Fallback parsing also failed: {fallback_error}")
+                        elif parsed_count < total_count and initial_non_null > 0:
                             failed_count = total_count - parsed_count
+                            date_conversion_stats['partial'] += 1
                             logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
+                        elif parsed_count > 0:
+                            date_conversion_stats['success'] += 1
+                            logging.info(f"   ✓ Converted {col} to datetime ({parsed_count:,} values)")
                         else:
-                            logging.info(f"✓ Converted {col} to datetime ({parsed_count:,} values)")
+                            date_conversion_stats['skipped'] += 1
+                            logging.debug(f"   ⏭️  {col}: All null, skipped")
                     except Exception as e:
+                        date_conversion_stats['failed'] += 1
                         logging.error(f"   ❌ Error converting {col} to datetime: {e}")
+                        logging.error(f"      Exception type: {type(e).__name__}")
+                        logging.error(traceback.format_exc())
                         # Try basic conversion as fallback
                         try:
                             df[col] = pd.to_datetime(df[col], errors='coerce')
-                        except:
-                            pass
+                            logging.info(f"      ✓ Fallback conversion attempted")
+                        except Exception as fallback_error:
+                            logging.error(f"      ❌ Fallback conversion failed: {fallback_error}")
+        
+        logging.info(f"   Date conversion summary: {date_conversion_stats['success']} successful, "
+                    f"{date_conversion_stats['partial']} partial, {date_conversion_stats['failed']} failed, "
+                    f"{date_conversion_stats['skipped']} skipped")
         
         # Convert boolean columns (handle BIT fields)
+        logging.info(f"\n⏳ Converting boolean columns...")
         bool_columns = ['active', 'made_sla', 'knowledge']
         for col in bool_columns:
             if col in df.columns:
-                if df[col].dtype == 'object':
-                    # Check if it's already boolean-like
-                    non_null = df[col].dropna()
-                    if len(non_null) > 0:
-                        unique_vals = non_null.astype(str).str.lower().unique()
-                        # Check if values are boolean-like
-                        bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off']
-                        bool_like = all(v in bool_like_values for v in unique_vals)
-                        
-                        if bool_like and len(unique_vals) <= 4:
-                            # Convert to boolean
-                            df[col] = df[col].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 't', 'on'])
-                            logging.info(f"   ✓ Converted {col} to boolean")
+                try:
+                    initial_dtype = df[col].dtype
+                    initial_non_null = df[col].notna().sum()
+                    
+                    if df[col].dtype == 'object':
+                        # Check if it's already boolean-like
+                        non_null = df[col].dropna()
+                        if len(non_null) > 0:
+                            unique_vals = non_null.astype(str).str.lower().unique()
+                            # Check if values are boolean-like
+                            bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off']
+                            bool_like = all(v in bool_like_values for v in unique_vals)
+                            
+                            if bool_like and len(unique_vals) <= 4:
+                                # Convert to boolean
+                                df[col] = df[col].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 't', 'on'])
+                                final_non_null = df[col].notna().sum()
+                                logging.info(f"   ✓ Converted {col} to boolean (non-null: {initial_non_null} -> {final_non_null}, unique values: {list(unique_vals)})")
+                            else:
+                                # Keep as string but log
+                                logging.warning(f"   ⚠️  {col} kept as string (not boolean-like: {list(unique_vals[:5])})")
                         else:
-                            # Keep as string but log
-                            logging.info(f"   ⚠️  {col} kept as string (not boolean-like: {list(unique_vals[:5])})")
+                            # All null, set to boolean with all False
+                            df[col] = False
+                            logging.info(f"   ✓ Set {col} to boolean (all False, was all null)")
                     else:
-                        # All null, set to boolean with all False
-                        df[col] = False
-                else:
-                    df[col] = df[col].astype(bool)
-                    logging.info(f"   ✓ Converted {col} to boolean")
+                        df[col] = df[col].astype(bool)
+                        final_non_null = df[col].notna().sum()
+                        logging.info(f"   ✓ Converted {col} from {initial_dtype} to boolean (non-null: {initial_non_null} -> {final_non_null})")
+                except Exception as e:
+                    logging.error(f"   ❌ Error converting {col} to boolean: {e}")
+                    logging.error(traceback.format_exc())
         
         # Convert integer columns
+        logging.info(f"\n⏳ Converting integer columns...")
         int_columns = ['reassignment_count', 'reopen_count']
         for col in int_columns:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+                try:
+                    initial_dtype = df[col].dtype
+                    initial_non_null = df[col].notna().sum()
+                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+                    final_non_null = df[col].notna().sum()
+                    logging.info(f"   ✓ Converted {col} from {initial_dtype} to Int64 (non-null: {initial_non_null} -> {final_non_null})")
+                except Exception as e:
+                    logging.error(f"   ❌ Error converting {col} to integer: {e}")
+                    logging.error(traceback.format_exc())
         
         # Keep duration fields as VARCHAR (don't convert to numeric or dates)
         # These should remain as strings per schema: time_worked, business_duration, calendar_duration
@@ -469,13 +535,22 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         duration_columns = ['time_worked', 'business_duration', 'calendar_duration']
         for col in duration_columns:
             if col in df.columns:
-                # Convert to string, handling all data types
-                if df[col].dtype == 'float64':
-                    # Convert float to string, handling NaN
-                    df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
-                else:
-                    df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
-                logging.info(f"   ✓ Ensured {col} is treated as string (not date/numeric)")
+                try:
+                    initial_dtype = df[col].dtype
+                    initial_non_null = df[col].notna().sum()
+                    
+                    # Convert to string, handling all data types
+                    if df[col].dtype == 'float64':
+                        # Convert float to string, handling NaN
+                        df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
+                    else:
+                        df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
+                    
+                    final_non_null = df[col].notna().sum()
+                    logging.info(f"   ✓ Ensured {col} is treated as string (dtype: {initial_dtype} -> object, non-null: {initial_non_null} -> {final_non_null})")
+                except Exception as e:
+                    logging.error(f"   ❌ Error converting {col} to string: {e}")
+                    logging.error(traceback.format_exc())
         
         # Create connection string with URL-encoded password
         # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
@@ -630,39 +705,60 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         
         # Validate and truncate VARCHAR columns to match table constraints
         logging.info(f"\n⏳ Validating data against table constraints...")
-        with engine.connect() as conn:
-            # Get column information including max lengths
-            result = conn.execute(text(f"""
-                SELECT 
-                    column_name,
-                    data_type,
-                    character_maximum_length
-                FROM information_schema.columns
-                WHERE table_name = '{table_name}'
-                AND table_schema = 'public'
-                AND character_maximum_length IS NOT NULL
-            """))
-            varchar_columns = {row[0]: row[2] for row in result.fetchall()}
-        
-        # Truncate values that exceed VARCHAR length
-        truncated_count = 0
-        for col_name, max_length in varchar_columns.items():
-            if col_name in df_final.columns:
-                # Check for values exceeding length
-                mask = df_final[col_name].notna()
-                if mask.any():
-                    str_series = df_final.loc[mask, col_name].astype(str)
-                    exceeds_mask = str_series.str.len() > max_length
-                    if exceeds_mask.any():
-                        count = exceeds_mask.sum()
-                        truncated_count += count
-                        df_final.loc[mask & exceeds_mask, col_name] = str_series.loc[exceeds_mask].str[:max_length]
-                        logging.warning(f"   ⚠️  Truncated {count:,} values in '{col_name}' (exceeded VARCHAR({max_length}))")
-        
-        if truncated_count > 0:
-            logging.warning(f"   ⚠️  Total truncated values: {truncated_count:,}")
-        else:
-            logging.info(f"   ✓ All VARCHAR values within constraints")
+        try:
+            with engine.connect() as conn:
+                # Get column information including max lengths
+                result = conn.execute(text(f"""
+                    SELECT 
+                        column_name,
+                        data_type,
+                        character_maximum_length
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name}'
+                    AND table_schema = 'public'
+                    AND character_maximum_length IS NOT NULL
+                """))
+                varchar_columns = {row[0]: row[2] for row in result.fetchall()}
+            
+            logging.info(f"   Found {len(varchar_columns)} VARCHAR columns with length constraints")
+            
+            # Truncate values that exceed VARCHAR length
+            truncated_count = 0
+            truncation_details = {}
+            
+            for col_name, max_length in varchar_columns.items():
+                if col_name in df_final.columns:
+                    try:
+                        # Check for values exceeding length
+                        mask = df_final[col_name].notna()
+                        if mask.any():
+                            str_series = df_final.loc[mask, col_name].astype(str)
+                            exceeds_mask = str_series.str.len() > max_length
+                            if exceeds_mask.any():
+                                count = exceeds_mask.sum()
+                                truncated_count += count
+                                max_exceeded = str_series.loc[exceeds_mask].str.len().max()
+                                truncation_details[col_name] = {
+                                    'count': count,
+                                    'max_length': max_length,
+                                    'max_exceeded': max_exceeded
+                                }
+                                df_final.loc[mask & exceeds_mask, col_name] = str_series.loc[exceeds_mask].str[:max_length]
+                                logging.warning(f"   ⚠️  Truncated {count:,} values in '{col_name}' (exceeded VARCHAR({max_length}), max was {max_exceeded})")
+                    except Exception as e:
+                        logging.error(f"   ❌ Error validating '{col_name}': {e}")
+                        logging.error(traceback.format_exc())
+            
+            if truncated_count > 0:
+                logging.warning(f"   ⚠️  Total truncated values: {truncated_count:,} across {len(truncation_details)} columns")
+                for col, details in truncation_details.items():
+                    logging.warning(f"      - {col}: {details['count']:,} values (max length: {details['max_exceeded']})")
+            else:
+                logging.info(f"   ✓ All VARCHAR values within constraints")
+        except Exception as e:
+            logging.error(f"   ❌ Error validating VARCHAR constraints: {e}")
+            logging.error(traceback.format_exc())
+            logging.warning(f"   ⚠️  Continuing without constraint validation...")
         
         # Check existing row count
         with engine.connect() as conn:
@@ -711,10 +807,17 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             'rows': f"{min(i+chunksize, total_rows):,}/{total_rows:,}"
                         })
                     except Exception as e:
-                        logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
+                        batch_num = i//chunksize + 1
+                        logging.error(f"   ❌ Error inserting batch {batch_num}/{num_chunks}: {e}")
+                        logging.error(f"      Exception type: {type(e).__name__}")
+                        logging.error(f"      Batch range: rows {i} to {min(i+chunksize, total_rows)}")
+                        logging.error(f"      Traceback: {traceback.format_exc()}")
+                        
                         # Try inserting row by row to identify problematic rows
                         logging.warning(f"   ⚠️  Attempting row-by-row insertion for this batch...")
                         failed_rows = 0
+                        successful_rows = 0
+                        
                         for idx, row in chunk_df.iterrows():
                             try:
                                 row.to_frame().T.to_sql(
@@ -725,14 +828,31 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                                     index=False
                                 )
                                 pbar.update(1)
+                                successful_rows += 1
                             except Exception as row_error:
                                 failed_rows += 1
-                                logging.error(f"   ❌ Failed to insert row {idx}: {row_error}")
-                                logging.error(f"      Incident: {row.get('incident_number', 'N/A')}")
+                                incident_num = row.get('incident_number', 'N/A')
+                                logging.error(f"   ❌ Failed to insert row {idx} (incident: {incident_num}): {row_error}")
+                                logging.error(f"      Exception type: {type(row_error).__name__}")
+                                
+                                # Log problematic column values if available
+                                if hasattr(row_error, 'args') and row_error.args:
+                                    logging.error(f"      Error details: {row_error.args[0] if row_error.args else 'N/A'}")
+                                
+                                # Only log first 5 failed rows in detail to avoid spam
+                                if failed_rows <= 5:
+                                    problem_cols = []
+                                    for col in df_final.columns:
+                                        val = row.get(col)
+                                        if pd.notna(val) and isinstance(val, str) and len(str(val)) > 100:
+                                            problem_cols.append(f"{col} (length: {len(str(val))})")
+                                    if problem_cols:
+                                        logging.error(f"      Potentially problematic columns: {', '.join(problem_cols[:3])}")
+                        
                         if failed_rows > 0:
-                            logging.warning(f"   ⚠️  {failed_rows} rows failed to insert in this batch")
+                            logging.warning(f"   ⚠️  Batch {batch_num}: {failed_rows} rows failed, {successful_rows} succeeded")
                         else:
-                            logging.info(f"   ✓ All rows in batch inserted successfully")
+                            logging.info(f"   ✓ All rows in batch {batch_num} inserted successfully")
         else:
             # Fallback: insert without progress bar but with logging
             logging.info("   (Install tqdm for progress bar: pip install tqdm)")
@@ -751,7 +871,11 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                     if (i // chunksize + 1) % 10 == 0 or i + chunksize >= total_rows:
                         logging.info(f"   Inserted {min(i+chunksize, total_rows):,}/{total_rows:,} rows...")
                 except Exception as e:
-                    logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
+                    batch_num = i//chunksize + 1
+                    logging.error(f"   ❌ Error inserting batch {batch_num}/{num_chunks}: {e}")
+                    logging.error(f"      Exception type: {type(e).__name__}")
+                    logging.error(f"      Batch range: rows {i} to {min(i+chunksize, total_rows)}")
+                    logging.error(f"      Traceback: {traceback.format_exc()}")
                     raise
         
         logging.info(f"✅ Insertion completed!")
@@ -759,11 +883,18 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         engine.dispose()
         
         # Verify final row count
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            final_rows = result.fetchone()[0]
-        engine.dispose()
+        logging.info(f"\n⏳ Verifying final row count...")
+        try:
+            engine = create_engine(connection_string, pool_pre_ping=True)
+            with engine.connect() as conn:
+                result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
+                final_rows = result.fetchone()[0]
+            engine.dispose()
+            logging.info(f"✓ Verified: {final_rows:,} rows in table")
+        except Exception as e:
+            logging.error(f"   ❌ Error verifying row count: {e}")
+            logging.error(traceback.format_exc())
+            final_rows = "Unknown"
         
         logging.info(f"\n{'='*80}")
         logging.info("✅ SUCCESS!")
@@ -779,8 +910,14 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         return True
         
     except Exception as e:
-        logging.error(f"\n✗ Failed to export to PostgreSQL: {e}")
+        logging.error(f"\n{'='*80}")
+        logging.error("❌ FAILED TO EXPORT TO POSTGRESQL")
+        logging.error(f"{'='*80}")
+        logging.error(f"Error: {e}")
+        logging.error(f"Error type: {type(e).__name__}")
+        logging.error(f"\nFull traceback:")
         logging.error(traceback.format_exc())
+        logging.error(f"{'='*80}\n")
         return False
 
 def main():
