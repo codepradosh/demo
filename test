@@ -49,13 +49,60 @@ except ImportError:
 # ------------------------------------------------------------------------
 # Logging Configuration
 # ------------------------------------------------------------------------
-def setup_logging():
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
+def setup_logging(log_file=None):
+    """
+    Set up logging configuration to both console and file.
+    
+    Parameters
+    ----------
+    log_file : str, optional
+        Path to log file. If None, creates a timestamped log file.
+    """
+    # Create log file name with timestamp if not provided
+    if log_file is None:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = f"push_incidents_to_postgres_{timestamp}.log"
+    
+    # Ensure log directory exists
+    log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else '.'
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Create formatters
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers to avoid duplicates
+    root_logger.handlers = []
+    
+    # Console handler (stdout)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(detailed_formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler
+    try:
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)  # More detailed in file
+        file_handler.setFormatter(detailed_formatter)
+        root_logger.addHandler(file_handler)
+        
+        # Note: Can't use logging.info here as logger might not be fully set up yet
+        print(f"📝 Logging to file: {os.path.abspath(log_file)}")
+    except Exception as e:
+        print(f"⚠️  Could not create log file '{log_file}': {e}")
+        print("   Continuing with console logging only...")
+    
+    return log_file
+    
+    return log_file
 
 # ------------------------------------------------------------------------
 # PostgreSQL Configuration
@@ -239,7 +286,7 @@ def create_table_from_dataframe(engine, df, table_name, schema='public'):
 # ------------------------------------------------------------------------
 def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
                                  user=None, host=None, port=None, password=None,
-                                 truncate=False, create_table=True):
+                                 truncate=False, create_table=True, log_file=None):
     """
     Push categorized incident CSV file to PostgreSQL table.
     
@@ -296,6 +343,8 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
         logging.info(f"   Create table: {create_table}")
         logging.info(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if log_file:
+            logging.info(f"   Log file: {os.path.abspath(log_file)}")
         logging.info("="*80)
         
         # Read CSV file
@@ -922,8 +971,6 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
 
 def main():
     """Main execution function."""
-    setup_logging()
-    
     parser = argparse.ArgumentParser(
         description='Push categorized incident CSV to PostgreSQL',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -931,6 +978,7 @@ def main():
 Examples:
   python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv
   python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --truncate
+  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --log-file my_log.log
 
 Environment variables (optional):
   PGHOST=localhost
@@ -952,8 +1000,13 @@ Or use .pgpass file for password-less authentication
                        help='Database name (default: from config)')
     parser.add_argument('--no-create-table', action='store_true',
                        help='Do not create table if it does not exist (default: auto-create)')
+    parser.add_argument('--log-file', type=str, default=None,
+                       help='Path to log file (default: auto-generated with timestamp)')
     
     args = parser.parse_args()
+    
+    # Setup logging (creates log file automatically if not specified)
+    log_file = setup_logging(args.log_file)
     
     # Check if file exists
     if not os.path.exists(args.csv_file):
@@ -966,12 +1019,15 @@ Or use .pgpass file for password-less authentication
         table_name=args.table,
         database=args.database,
         truncate=args.truncate,
-        create_table=not args.no_create_table
+        create_table=not args.no_create_table,
+        log_file=log_file
     )
     
     if success:
+        logging.info(f"\n📝 Full log saved to: {os.path.abspath(log_file)}")
         sys.exit(0)
     else:
+        logging.error(f"\n📝 Error log saved to: {os.path.abspath(log_file)}")
         sys.exit(1)
 
 if __name__ == "__main__":
