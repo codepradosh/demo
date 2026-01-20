@@ -1,742 +1,248 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Push categorized incident CSV file to PostgreSQL table Incident_Data
-Usage: python push_incidents_to_postgres.py <csv_file_path> [--truncate]
+CSV Column Data Type Analyzer
+Analyzes a CSV file and displays data types, sample values, and statistics for each column.
+Usage: python analyze_csv_columns.py <csv_file_path>
 """
 
 import os
 import sys
 import pandas as pd
-import traceback
-import logging
-import re
-from datetime import datetime
-import argparse
-from urllib.parse import quote_plus
+import numpy as np
+from collections import Counter
 
-# Progress bar
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-    # Fallback: create a dummy tqdm that does nothing
-    class tqdm:
-        def __init__(self, *args, **kwargs):
-            pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def update(self, n):
-            pass
-        def set_postfix(self, *args, **kwargs):
-            pass
-
-# PostgreSQL client
-try:
-    import psycopg2
-    from sqlalchemy import create_engine, text, inspect
-    from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
-    POSTGRES_AVAILABLE = True
-except ImportError:
-    POSTGRES_AVAILABLE = False
-    print("ERROR: PostgreSQL libraries not available.")
-    print("Please install: pip install psycopg2-binary sqlalchemy pandas")
-    sys.exit(1)
-
-# ------------------------------------------------------------------------
-# Logging Configuration
-# ------------------------------------------------------------------------
-def setup_logging():
-    """Set up logging configuration."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-# ------------------------------------------------------------------------
-# PostgreSQL Configuration
-# ------------------------------------------------------------------------
-POSTGRES_CONFIG = {
-    'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
-    'port': os.getenv('PGPORT', '5432'),
-    'database': os.getenv('PGDATABASE', 'service_automation_db'),
-    'user': os.getenv('PGUSER', 'powerbi_user'),
-    'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'incident_data'  # Changed to lowercase incident_data
-}
-
-# ------------------------------------------------------------------------
-# Data Type Inference
-# ------------------------------------------------------------------------
-def infer_postgres_type(series, col_name):
+def analyze_csv_columns(csv_file_path):
     """
-    Infer PostgreSQL data type from pandas Series.
-    
-    Parameters
-    ----------
-    series : pd.Series
-        The pandas Series to analyze
-    col_name : str
-        Column name (for special handling)
-    
-    Returns
-    -------
-    sqlalchemy.types.TypeEngine
-        SQLAlchemy type for PostgreSQL
-    """
-    # Remove null values for type inference
-    non_null = series.dropna()
-    
-    if len(non_null) == 0:
-        # All nulls - default to Text
-        return Text
-    
-    # Check for boolean
-    if series.dtype == 'bool' or non_null.dtype == 'bool':
-        return Boolean
-    
-    # Check for datetime
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return DateTime
-    
-    # Check for date
-    if pd.api.types.is_datetime64_any_dtype(series) and 'date' in col_name.lower():
-        # Try to parse as date if it's a date column
-        try:
-            pd.to_datetime(non_null.iloc[0])
-            return Date
-        except:
-            pass
-    
-    # Check for integer
-    if pd.api.types.is_integer_dtype(series):
-        # Check if values fit in regular integer or need bigint
-        if non_null.abs().max() < 2147483647:  # PostgreSQL INTEGER max
-            return Integer
-        else:
-            return BigInteger
-    
-    # Check for float
-    if pd.api.types.is_float_dtype(series):
-        return Float
-    
-    # Check if numeric string can be converted to int
-    if series.dtype == 'object':
-        # Try to convert to numeric
-        try:
-            numeric_series = pd.to_numeric(non_null, errors='coerce')
-            if numeric_series.notna().sum() == len(non_null):
-                # All values are numeric
-                if numeric_series.abs().max() < 2147483647:
-                    return Integer
-                else:
-                    return BigInteger
-        except:
-            pass
-    
-    # Check string length for VARCHAR vs TEXT
-    if series.dtype == 'object':
-        max_length = non_null.astype(str).str.len().max()
-        if max_length > 0 and max_length < 255:
-            # Use VARCHAR with some buffer
-            return String(max_length + 50)  # Add 50 char buffer
-        else:
-            return Text
-    
-    # Default to Text
-    return Text
-
-def create_table_from_dataframe(engine, df, table_name, schema='public'):
-    """
-    Create PostgreSQL table from DataFrame with inferred data types.
-    
-    Parameters
-    ----------
-    engine : sqlalchemy.engine.Engine
-        SQLAlchemy engine
-    df : pd.DataFrame
-        DataFrame to create table from
-    table_name : str
-        Table name (will be created in lowercase)
-    schema : str
-        Schema name (default: 'public')
-    
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    try:
-        logging.info(f"\n{'='*80}")
-        logging.info(f"📋 CREATING TABLE: {table_name}")
-        logging.info(f"{'='*80}")
-        
-        # Infer column types
-        column_types = {}
-        for col in df.columns:
-            pg_type = infer_postgres_type(df[col], col)
-            column_types[col] = pg_type
-            logging.info(f"   {col}: {pg_type}")
-        
-        # Build CREATE TABLE SQL
-        columns_sql = []
-        for col in df.columns:
-            pg_type = column_types[col]
-            
-            # Convert SQLAlchemy type to PostgreSQL type string
-            if pg_type == Boolean:
-                type_str = "BOOLEAN"
-            elif pg_type == Integer:
-                type_str = "INTEGER"
-            elif pg_type == BigInteger:
-                type_str = "BIGINT"
-            elif pg_type == Float:
-                type_str = "DOUBLE PRECISION"
-            elif pg_type == DateTime:
-                type_str = "TIMESTAMP"
-            elif pg_type == Date:
-                type_str = "DATE"
-            elif isinstance(pg_type, String):
-                type_str = f"VARCHAR({pg_type.length})"
-            else:
-                type_str = "TEXT"
-            
-            # Escape column name if needed
-            col_escaped = f'"{col}"'
-            columns_sql.append(f"{col_escaped} {type_str}")
-        
-        # Add created_at and updated_at timestamps
-        columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {schema}."{table_name}" (
-            {', '.join(columns_sql)}
-        );
-        """
-        
-        logging.info(f"\n⏳ Creating table '{table_name}'...")
-        with engine.connect() as conn:
-            conn.execute(text(create_table_sql))
-            conn.commit()
-        
-        logging.info(f"✅ Table '{table_name}' created successfully")
-        logging.info(f"   Columns: {len(df.columns) + 2} (including created_at, updated_at)")
-        
-        return True
-        
-    except Exception as e:
-        logging.error(f"❌ Error creating table: {e}")
-        logging.error(traceback.format_exc())
-        return False
-
-# ------------------------------------------------------------------------
-# Main Function
-# ------------------------------------------------------------------------
-def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
-                                 user=None, host=None, port=None, password=None,
-                                 truncate=False, create_table=True):
-    """
-    Push categorized incident CSV file to PostgreSQL table.
+    Analyze CSV file and display column information including data types.
     
     Parameters
     ----------
     csv_file_path : str
-        Path to the categorized CSV file to import
-    table_name : str, optional
-        Target table name (default: 'Incident_Data')
-    database : str, optional
-        Database name (default: from config or 'service_automation_db')
-    user : str, optional
-        PostgreSQL username (default: from config)
-    host : str, optional
-        PostgreSQL host (default: from config)
-    port : str, optional
-        PostgreSQL port (default: from config or '5432')
-    password : str, optional
-        PostgreSQL password (default: from environment variable PGPASSWORD)
-    truncate : bool, optional
-        If True, truncate table before inserting (default: False)
-        
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
+        Path to the CSV file to analyze
     """
-    if not POSTGRES_AVAILABLE:
-        logging.error("✗ PostgreSQL libraries not available. Cannot export to PostgreSQL.")
-        return False
-    
     if not os.path.exists(csv_file_path):
-        logging.error(f"✗ CSV file not found: {csv_file_path}")
-        return False
+        print(f"❌ CSV file not found: {csv_file_path}")
+        return
     
-    # Use provided values or fall back to config/environment
-    table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()  # Ensure lowercase
-    database = database or POSTGRES_CONFIG['database']
-    user = user or POSTGRES_CONFIG['user']
-    host = host or POSTGRES_CONFIG['host']
-    port = port or POSTGRES_CONFIG['port']
-    password = password or POSTGRES_CONFIG['password']
+    print("=" * 100)
+    print("📊 CSV COLUMN DATA TYPE ANALYZER")
+    print("=" * 100)
+    print(f"📁 File: {csv_file_path}\n")
     
+    # Read CSV file
+    print("⏳ Reading CSV file...")
     try:
-        logging.info("="*80)
-        logging.info("📤 Pushing Incident CSV to PostgreSQL")
-        logging.info("="*80)
-        logging.info(f"   CSV file: {csv_file_path}")
-        logging.info(f"   Database: {database}")
-        logging.info(f"   Table: {table_name}")
-        logging.info(f"   Host: {host}:{port}")
-        logging.info(f"   User: {user}")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Create table: {create_table}")
-        logging.info("="*80)
-        
-        # Read CSV file
-        logging.info(f"\n⏳ Reading CSV file...")
+        df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
+    except UnicodeDecodeError:
         try:
-            df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
-        except UnicodeDecodeError:
-            try:
-                df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
-            except:
-                df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
+            df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
+            print("   ⚠️  Used latin-1 encoding")
+        except:
+            df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
+            print("   ⚠️  Used cp1252 encoding")
+    
+    print(f"✅ Read {len(df):,} rows, {len(df.columns)} columns\n")
+    
+    # Analyze each column
+    print("=" * 100)
+    print("COLUMN ANALYSIS")
+    print("=" * 100)
+    
+    results = []
+    
+    for idx, col in enumerate(df.columns, 1):
+        print(f"\n[{idx}/{len(df.columns)}] Column: '{col}'")
+        print("-" * 100)
         
-        logging.info(f"✓ Read {len(df):,} rows from CSV")
-        logging.info(f"✓ Columns: {len(df.columns)} ({', '.join(df.columns[:5])}...)")
+        # Basic info
+        total_count = len(df[col])
+        non_null_count = df[col].notna().sum()
+        null_count = total_count - non_null_count
+        null_percentage = (null_count / total_count * 100) if total_count > 0 else 0
         
-        # Custom date parsing function to handle various formats
-        def parse_datetime_robust(series):
-            """Parse datetime with handling for various malformed formats"""
-            if series.dtype != 'object':
-                return pd.to_datetime(series, errors='coerce')
-            
-            # Convert to string and handle NaN
-            str_series = series.astype(str)
-            str_series = str_series.replace('nan', None)
-            str_series = str_series.replace('None', None)
-            str_series = str_series.replace('', None)
-            
-            # Normalize common malformed formats
-            def normalize_date(date_str):
-                if pd.isna(date_str) or date_str is None or date_str == 'None' or date_str == '':
-                    return None
+        print(f"   Total rows: {total_count:,}")
+        print(f"   Non-null: {non_null_count:,} ({100-null_percentage:.1f}%)")
+        print(f"   Null/Empty: {null_count:,} ({null_percentage:.1f}%)")
+        
+        # Pandas dtype
+        pandas_dtype = df[col].dtype
+        print(f"   Pandas dtype: {pandas_dtype}")
+        
+        # Actual data type analysis
+        non_null_series = df[col].dropna()
+        
+        if len(non_null_series) == 0:
+            print(f"   ⚠️  All values are NULL/Empty")
+            inferred_type = "UNKNOWN (all null)"
+            sample_values = ["N/A"]
+        else:
+            # Check for datetime
+            is_datetime = pd.api.types.is_datetime64_any_dtype(df[col])
+            if is_datetime:
+                inferred_type = "DATETIME"
+                sample_values = non_null_series.head(3).astype(str).tolist()
+                print(f"   ✅ Detected as: DATETIME")
+            # Check for boolean
+            elif pandas_dtype == 'bool' or (pandas_dtype == 'object' and 
+                    non_null_series.astype(str).str.lower().isin(['true', 'false', '1', '0', 'yes', 'no']).all()):
+                inferred_type = "BOOLEAN"
+                unique_vals = non_null_series.unique()[:5]
+                sample_values = [str(v) for v in unique_vals]
+                print(f"   ✅ Detected as: BOOLEAN")
+            # Check for integer
+            elif pd.api.types.is_integer_dtype(df[col]):
+                inferred_type = "INTEGER"
+                min_val = non_null_series.min()
+                max_val = non_null_series.max()
+                sample_values = non_null_series.head(3).tolist()
+                print(f"   ✅ Detected as: INTEGER")
+                print(f"   Range: {min_val} to {max_val}")
+            # Check for float
+            elif pd.api.types.is_float_dtype(df[col]):
+                inferred_type = "FLOAT"
+                min_val = non_null_series.min()
+                max_val = non_null_series.max()
+                sample_values = non_null_series.head(3).tolist()
+                print(f"   ✅ Detected as: FLOAT")
+                print(f"   Range: {min_val:.2f} to {max_val:.2f}")
+            # Check if numeric string
+            elif pandas_dtype == 'object':
+                # Try to convert to numeric
+                numeric_series = pd.to_numeric(non_null_series, errors='coerce')
+                numeric_count = numeric_series.notna().sum()
                 
-                date_str = str(date_str).strip()
-                
-                # Handle format: 2026-01-1407:13:58.001+0000 (missing space)
-                # Pattern: YYYY-MM-DDHH:MM:SS.mmm+TZ
-                if re.match(r'^\d{4}-\d{2}-\d{2}\d{2}:\d{2}:\d{2}', date_str):
-                    # Insert space between date and time
-                    date_str = re.sub(r'^(\d{4}-\d{2}-\d{2})(\d{2}:\d{2}:\d{2})', r'\1 \2', date_str)
-                
-                # Handle format: 2026-01-14 07:13:58:57+00:00 (colon instead of dot for milliseconds)
-                # Pattern: YYYY-MM-DD HH:MM:SS:mmm+TZ or YYYY-MM-DD HH:MM:SS:mmm+TZ:ZZ
-                # Replace colon before timezone (but not the timezone colon) with dot
-                # Match pattern: HH:MM:SS:mmm followed by timezone
-                if re.search(r'\d{2}:\d{2}:\d{2}:\d{1,3}[+-]', date_str):
-                    # Replace the colon between seconds and milliseconds (before timezone)
-                    date_str = re.sub(r'(\d{2}:\d{2}:\d{2}):(\d{1,3})([+-])', r'\1.\2\3', date_str)
-                
-                # Normalize timezone format: +0000 to +00:00
-                if re.search(r'[+-]\d{4}$', date_str):
-                    # Format: +0000 or -0500 at the end
-                    date_str = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', date_str)
-                
-                return date_str
-            
-            # Apply normalization
-            normalized = str_series.apply(normalize_date)
-            
-            # Try parsing with multiple formats
-            try:
-                # First try with pandas default parser
-                result = pd.to_datetime(normalized, errors='coerce', infer_datetime_format=True)
-                
-                # Check if we have any nulls that might be parseable with different format
-                null_mask = result.isna()
-                if null_mask.any():
-                    # Try alternative parsing for null values
-                    for fmt in [
-                        '%Y-%m-%d %H:%M:%S.%f%z',
-                        '%Y-%m-%d %H:%M:%S%z',
-                        '%Y-%m-%d %H:%M:%S',
-                        '%Y-%m-%dT%H:%M:%S.%f%z',
-                        '%Y-%m-%dT%H:%M:%S%z',
-                    ]:
+                if numeric_count == len(non_null_series):
+                    # All numeric
+                    if numeric_series.dtype in ['int64', 'Int64']:
+                        inferred_type = "INTEGER (string)"
+                        min_val = numeric_series.min()
+                        max_val = numeric_series.max()
+                        print(f"   ✅ Detected as: INTEGER (stored as string)")
+                        print(f"   Range: {min_val} to {max_val}")
+                    else:
+                        inferred_type = "FLOAT (string)"
+                        min_val = numeric_series.min()
+                        max_val = numeric_series.max()
+                        print(f"   ✅ Detected as: FLOAT (stored as string)")
+                        print(f"   Range: {min_val:.2f} to {max_val:.2f}")
+                    sample_values = non_null_series.head(3).tolist()
+                else:
+                    # String type
+                    str_series = non_null_series.astype(str)
+                    max_length = str_series.str.len().max()
+                    min_length = str_series.str.len().min()
+                    avg_length = str_series.str.len().mean()
+                    
+                    # Check if it looks like a date string
+                    date_like = False
+                    if any(keyword in col.lower() for keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
+                        date_like = True
+                        # Try to parse as date
                         try:
-                            alt_result = pd.to_datetime(normalized[null_mask], format=fmt, errors='coerce')
-                            result.loc[null_mask] = alt_result
-                            null_mask = result.isna()
-                            if not null_mask.any():
-                                break
-                        except:
-                            continue
-                
-                return result
-            except Exception as e:
-                logging.warning(f"   ⚠️  Date parsing error: {e}, using fallback")
-                return pd.to_datetime(normalized, errors='coerce')
-        
-        # Convert date columns to datetime if they're strings
-        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
-                        'created_on', 'updated_on', 'opened_date', 'closed_date']
-        for col in df.columns:
-            if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
-                if df[col].dtype == 'object':
-                    try:
-                        df[col] = parse_datetime_robust(df[col])
-                        # Check how many were successfully parsed
-                        parsed_count = df[col].notna().sum()
-                        total_count = len(df[col])
-                        if parsed_count < total_count:
-                            failed_count = total_count - parsed_count
-                            logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
-                        else:
-                            logging.info(f"✓ Converted {col} to datetime ({parsed_count:,} values)")
-                    except Exception as e:
-                        logging.error(f"   ❌ Error converting {col} to datetime: {e}")
-                        # Try basic conversion as fallback
-                        try:
-                            df[col] = pd.to_datetime(df[col], errors='coerce')
+                            test_dates = pd.to_datetime(str_series.head(100), errors='coerce')
+                            if test_dates.notna().sum() > len(test_dates) * 0.8:  # 80% parseable
+                                inferred_type = "DATETIME (string)"
+                                print(f"   ✅ Detected as: DATETIME (stored as string)")
+                                date_like = True
                         except:
                             pass
-        
-        # Convert boolean columns (handle BIT fields)
-        bool_columns = ['active', 'made_sla', 'knowledge']
-        for col in bool_columns:
-            if col in df.columns:
-                # Handle various boolean representations
-                if df[col].dtype == 'object':
-                    # Convert string representations to boolean
-                    df[col] = df[col].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 't', 'on'])
-                else:
-                    df[col] = df[col].astype(bool)
-        
-        # Convert integer columns
-        int_columns = ['reassignment_count', 'reopen_count']
-        for col in int_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
-        
-        # Keep duration fields as VARCHAR (don't convert to numeric)
-        # These should remain as strings per schema: time_worked, business_duration, calendar_duration
-        duration_columns = ['time_worked', 'business_duration', 'calendar_duration']
-        for col in duration_columns:
-            if col in df.columns:
-                df[col] = df[col].astype(str).replace('nan', None)
-        
-        # Create connection string with URL-encoded password
-        # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
-        if password:
-            # URL-encode the password to handle special characters like @
-            encoded_password = quote_plus(password)
-            connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
-        else:
-            # Try without password (trust authentication or .pgpass)
-            connection_string = f"postgresql://{user}@{host}:{port}/{database}"
-        
-        # Create SQLAlchemy engine
-        logging.info(f"\n⏳ Connecting to PostgreSQL...")
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        
-        # Test connection
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logging.info(f"✓ Connected to PostgreSQL successfully")
-        
-        # Check if table exists
-        logging.info(f"\n⏳ Checking if table '{table_name}' exists...")
-        inspector = inspect(engine)
-        table_exists = inspector.has_table(table_name, schema='public')
-        
-        if not table_exists:
-            if create_table:
-                logging.info(f"⚠️  Table '{table_name}' does not exist. Creating it...")
-                success = create_table_from_dataframe(engine, df, table_name)
-                if not success:
-                    logging.error(f"✗ Failed to create table '{table_name}'")
-                    engine.dispose()
-                    return False
+                    
+                    if not date_like:
+                        inferred_type = "STRING/VARCHAR"
+                        print(f"   ✅ Detected as: STRING/VARCHAR")
+                    
+                    print(f"   String length: min={min_length}, max={max_length}, avg={avg_length:.1f}")
+                    
+                    # Show unique value count
+                    unique_count = non_null_series.nunique()
+                    print(f"   Unique values: {unique_count:,}")
+                    
+                    # Sample values
+                    sample_values = non_null_series.head(3).tolist()
+                    
+                    # Show most common values if not too many unique
+                    if unique_count <= 20 and unique_count > 0:
+                        print(f"   Most common values:")
+                        value_counts = non_null_series.value_counts().head(5)
+                        for val, count in value_counts.items():
+                            print(f"      '{val}': {count:,} ({count/len(non_null_series)*100:.1f}%)")
             else:
-                logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
-                logging.error(f"  Use --create-table to create it automatically")
-                engine.dispose()
-                return False
+                inferred_type = f"UNKNOWN ({pandas_dtype})"
+                sample_values = non_null_series.head(3).tolist()
+        
+        # Show sample values
+        print(f"   Sample values:")
+        for i, val in enumerate(sample_values[:3], 1):
+            val_str = str(val)
+            if len(val_str) > 80:
+                val_str = val_str[:77] + "..."
+            print(f"      {i}. {val_str}")
+        
+        # Store results
+        results.append({
+            'column': col,
+            'pandas_dtype': str(pandas_dtype),
+            'inferred_type': inferred_type,
+            'non_null': non_null_count,
+            'null': null_count,
+            'null_pct': null_percentage,
+            'max_length': max_length if inferred_type == "STRING/VARCHAR" else None
+        })
+    
+    # Summary table
+    print("\n" + "=" * 100)
+    print("SUMMARY TABLE")
+    print("=" * 100)
+    print(f"{'Column Name':<40} {'Pandas Type':<15} {'Inferred Type':<20} {'Non-Null':<12} {'Null %':<10}")
+    print("-" * 100)
+    
+    for r in results:
+        col_name = r['column'][:38] + ".." if len(r['column']) > 40 else r['column']
+        print(f"{col_name:<40} {r['pandas_dtype']:<15} {r['inferred_type']:<20} {r['non_null']:<12,} {r['null_pct']:<10.1f}")
+    
+    # PostgreSQL type recommendations
+    print("\n" + "=" * 100)
+    print("POSTGRESQL TYPE RECOMMENDATIONS")
+    print("=" * 100)
+    
+    for r in results:
+        col = r['column']
+        inferred = r['inferred_type']
+        max_len = r['max_length']
+        
+        if inferred == "DATETIME" or inferred == "DATETIME (string)":
+            pg_type = "TIMESTAMP"
+        elif inferred == "BOOLEAN":
+            pg_type = "BOOLEAN or BIT(1)"
+        elif inferred == "INTEGER" or inferred == "INTEGER (string)":
+            pg_type = "INTEGER"
+        elif inferred == "FLOAT" or inferred == "FLOAT (string)":
+            pg_type = "DOUBLE PRECISION"
+        elif inferred == "STRING/VARCHAR":
+            if max_len and max_len <= 50:
+                pg_type = f"VARCHAR({max_len + 10})"
+            elif max_len and max_len <= 255:
+                pg_type = f"VARCHAR({max_len + 20})"
+            else:
+                pg_type = "TEXT"
         else:
-            logging.info(f"✓ Table '{table_name}' exists")
+            pg_type = "TEXT"
         
-        # Get table column names
-        logging.info(f"\n⏳ Fetching table column names...")
-        table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
-        
-        col_count = len(table_columns)
-        logging.info(f"✓ Table has {col_count} columns")
-        
-        # Validate CSV columns match table columns
-        logging.info(f"\n⏳ Validating column names...")
-        
-        csv_columns = [col for col in df.columns]
-        table_columns_lower = {col.lower(): col for col in table_columns}
-        
-        # Create column mapping (case-insensitive match)
-        column_mapping = {}
-        for csv_col in csv_columns:
-            csv_col_lower = csv_col.lower()
-            if csv_col_lower in table_columns_lower:
-                table_col = table_columns_lower[csv_col_lower]
-                if csv_col != table_col:
-                    column_mapping[csv_col] = table_col
-        
-        if column_mapping:
-            df.rename(columns=column_mapping, inplace=True)
-            logging.info(f"✓ Renamed {len(column_mapping)} columns to match table case")
-        
-        # Find missing columns in CSV
-        metadata_cols = {'created_at', 'updated_at'}
-        missing_in_csv = []
-        for table_col in table_columns:
-            if table_col.lower() not in [c.lower() for c in df.columns] and table_col not in metadata_cols:
-                missing_in_csv.append(table_col)
-                df[table_col] = None
-        
-        if missing_in_csv:
-            logging.warning(f"\n⚠️  CSV is missing {len(missing_in_csv)} table columns (set to NULL):")
-            for col in missing_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(missing_in_csv) > 10:
-                logging.warning(f"   ... and {len(missing_in_csv) - 10} more")
-        
-        # Find extra columns in CSV (not in table)
-        extra_in_csv = []
-        for csv_col in df.columns:
-            if csv_col not in table_columns and csv_col not in metadata_cols:
-                extra_in_csv.append(csv_col)
-        
-        if extra_in_csv:
-            logging.warning(f"\n⚠️  CSV has {len(extra_in_csv)} extra columns (will be ignored):")
-            for col in extra_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(extra_in_csv) > 10:
-                logging.warning(f"   ... and {len(extra_in_csv) - 10} more")
-        
-        # Filter DataFrame to only include columns that exist in table
-        columns_to_insert = [col for col in table_columns if col not in metadata_cols]
-        df_final = df[[col for col in columns_to_insert if col in df.columns]].copy()
-        
-        # Validate and truncate VARCHAR columns to match table constraints
-        logging.info(f"\n⏳ Validating data against table constraints...")
-        with engine.connect() as conn:
-            # Get column information including max lengths
-            result = conn.execute(text(f"""
-                SELECT 
-                    column_name,
-                    data_type,
-                    character_maximum_length
-                FROM information_schema.columns
-                WHERE table_name = '{table_name}'
-                AND table_schema = 'public'
-                AND character_maximum_length IS NOT NULL
-            """))
-            varchar_columns = {row[0]: row[2] for row in result.fetchall()}
-        
-        # Truncate values that exceed VARCHAR length
-        truncated_count = 0
-        for col_name, max_length in varchar_columns.items():
-            if col_name in df_final.columns:
-                # Check for values exceeding length
-                mask = df_final[col_name].notna()
-                if mask.any():
-                    str_series = df_final.loc[mask, col_name].astype(str)
-                    exceeds_mask = str_series.str.len() > max_length
-                    if exceeds_mask.any():
-                        count = exceeds_mask.sum()
-                        truncated_count += count
-                        df_final.loc[mask & exceeds_mask, col_name] = str_series.loc[exceeds_mask].str[:max_length]
-                        logging.warning(f"   ⚠️  Truncated {count:,} values in '{col_name}' (exceeded VARCHAR({max_length}))")
-        
-        if truncated_count > 0:
-            logging.warning(f"   ⚠️  Total truncated values: {truncated_count:,}")
-        else:
-            logging.info(f"   ✓ All VARCHAR values within constraints")
-        
-        # Check existing row count
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            existing_rows = result.fetchone()[0]
-        logging.info(f"✓ Table currently has {existing_rows:,} rows")
-        
-        # Truncate table if requested
-        if truncate:
-            logging.info(f"\n⏳ Truncating table '{table_name}'...")
-            with engine.connect() as conn:
-                conn.execute(text(f'TRUNCATE TABLE "{table_name}";'))
-                conn.commit()
-            logging.info(f"✓ Table truncated")
-        
-        # Push to database with progress bar
-        total_rows = len(df_final)
-        chunksize = 1000
-        num_chunks = (total_rows + chunksize - 1) // chunksize
-        
-        logging.info(f"\n⏳ Writing {total_rows:,} rows to PostgreSQL table '{table_name}'...")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Columns: {len(df_final.columns)} columns matching table structure")
-        logging.info(f"   Chunk size: {chunksize:,} rows per batch")
-        logging.info(f"   Total batches: {num_chunks:,}")
-        
-        # Insert with progress bar and error handling
-        if TQDM_AVAILABLE:
-            with tqdm(total=total_rows, desc="Inserting rows", unit="row", unit_scale=True, ncols=100) as pbar:
-                for i in range(0, total_rows, chunksize):
-                    chunk_df = df_final.iloc[i:i+chunksize].copy()
-                    try:
-                        chunk_df.to_sql(
-                            name=table_name,
-                            con=engine,
-                            schema='public',
-                            if_exists='append',  # Append since we truncated if needed
-                            index=False,
-                            method='multi',  # Use multi-row INSERT for better performance
-                            chunksize=chunksize
-                        )
-                        pbar.update(len(chunk_df))
-                        # Update description with current progress
-                        pbar.set_postfix({
-                            'batch': f"{i//chunksize + 1}/{num_chunks}",
-                            'rows': f"{min(i+chunksize, total_rows):,}/{total_rows:,}"
-                        })
-                    except Exception as e:
-                        logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
-                        # Try inserting row by row to identify problematic rows
-                        logging.warning(f"   ⚠️  Attempting row-by-row insertion for this batch...")
-                        failed_rows = 0
-                        for idx, row in chunk_df.iterrows():
-                            try:
-                                row.to_frame().T.to_sql(
-                                    name=table_name,
-                                    con=engine,
-                                    schema='public',
-                                    if_exists='append',
-                                    index=False
-                                )
-                                pbar.update(1)
-                            except Exception as row_error:
-                                failed_rows += 1
-                                logging.error(f"   ❌ Failed to insert row {idx}: {row_error}")
-                                logging.error(f"      Incident: {row.get('incident_number', 'N/A')}")
-                        if failed_rows > 0:
-                            logging.warning(f"   ⚠️  {failed_rows} rows failed to insert in this batch")
-                        else:
-                            logging.info(f"   ✓ All rows in batch inserted successfully")
-        else:
-            # Fallback: insert without progress bar but with logging
-            logging.info("   (Install tqdm for progress bar: pip install tqdm)")
-            for i in range(0, total_rows, chunksize):
-                chunk_df = df_final.iloc[i:i+chunksize].copy()
-                try:
-                    chunk_df.to_sql(
-                        name=table_name,
-                        con=engine,
-                        schema='public',
-                        if_exists='append',  # Append since we truncated if needed
-                        index=False,
-                        method='multi',  # Use multi-row INSERT for better performance
-                        chunksize=chunksize
-                    )
-                    if (i // chunksize + 1) % 10 == 0 or i + chunksize >= total_rows:
-                        logging.info(f"   Inserted {min(i+chunksize, total_rows):,}/{total_rows:,} rows...")
-                except Exception as e:
-                    logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
-                    raise
-        
-        logging.info(f"✅ Insertion completed!")
-        
-        engine.dispose()
-        
-        # Verify final row count
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            final_rows = result.fetchone()[0]
-        engine.dispose()
-        
-        logging.info(f"\n{'='*80}")
-        logging.info("✅ SUCCESS!")
-        logging.info(f"{'='*80}")
-        logging.info(f"✓ Wrote {len(df_final):,} rows to PostgreSQL")
-        logging.info(f"✓ Database: {database}")
-        logging.info(f"✓ Table: {table_name}")
-        logging.info(f"✓ Total rows in table now: {final_rows:,}")
-        if not truncate:
-            logging.info(f"   (Previous: {existing_rows:,}, Added: {len(df_final):,})")
-        logging.info(f"{'='*80}\n")
-        
-        return True
-        
-    except Exception as e:
-        logging.error(f"\n✗ Failed to export to PostgreSQL: {e}")
-        logging.error(traceback.format_exc())
-        return False
+        print(f"   {col:<40} -> {pg_type}")
+    
+    print("\n" + "=" * 100)
+    print("✅ Analysis complete!")
+    print("=" * 100)
 
 def main():
     """Main execution function."""
-    setup_logging()
-    
-    parser = argparse.ArgumentParser(
-        description='Push categorized incident CSV to PostgreSQL',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --truncate
-
-Environment variables (optional):
-  PGHOST=localhost
-  PGPORT=5432
-  PGDATABASE=service_automation_db
-  PGUSER=postgres
-  PGPASSWORD=your_password
-
-Or use .pgpass file for password-less authentication
-        """
-    )
-    
-    parser.add_argument('csv_file', help='Path to categorized incident CSV file')
-    parser.add_argument('--truncate', action='store_true', 
-                       help='Truncate table before inserting (overwrite mode)')
-    parser.add_argument('--table', type=str, default=None,
-                       help='Table name (default: incident_data, will be lowercase)')
-    parser.add_argument('--database', type=str, default=None,
-                       help='Database name (default: from config)')
-    parser.add_argument('--no-create-table', action='store_true',
-                       help='Do not create table if it does not exist (default: auto-create)')
-    
-    args = parser.parse_args()
-    
-    # Check if file exists
-    if not os.path.exists(args.csv_file):
-        logging.error(f"✗ CSV file not found: {args.csv_file}")
+    if len(sys.argv) < 2:
+        print("Usage: python analyze_csv_columns.py <csv_file_path>")
         sys.exit(1)
     
-    # Push to PostgreSQL
-    success = push_incidents_to_postgresql(
-        args.csv_file,
-        table_name=args.table,
-        database=args.database,
-        truncate=args.truncate,
-        create_table=not args.no_create_table
-    )
-    
-    if success:
-        sys.exit(0)
-    else:
-        sys.exit(1)
+    csv_file = sys.argv[1]
+    analyze_csv_columns(csv_file)
 
 if __name__ == "__main__":
     main()
-
