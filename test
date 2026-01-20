@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CSV Column Data Type Analyzer
+CSV Column Data Type Analyzer (Improved)
 Analyzes a CSV file and displays data types, sample values, and statistics for each column.
 Usage: python analyze_csv_columns.py <csv_file_path>
 """
@@ -10,23 +10,36 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-from collections import Counter
+import re
+
+def is_date_column(col_name):
+    """Check if column name suggests it's a date/time column"""
+    date_keywords = ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved', 'at']
+    col_lower = col_name.lower()
+    # Exclude user/GPN columns from date detection
+    exclude_keywords = ['user_name', 'gpn', 'by_name', 'by_gpn', 'updated_by', 'created_by']
+    if any(excl in col_lower for excl in exclude_keywords):
+        return False
+    return any(keyword in col_lower for keyword in date_keywords)
+
+def is_gpn_column(col_name):
+    """Check if column is a GPN (Global Personnel Number) column"""
+    return 'gpn' in col_name.lower()
+
+def is_user_name_column(col_name):
+    """Check if column is a user name column"""
+    return 'user_name' in col_name.lower() or 'by_name' in col_name.lower()
 
 def analyze_csv_columns(csv_file_path):
     """
     Analyze CSV file and display column information including data types.
-    
-    Parameters
-    ----------
-    csv_file_path : str
-        Path to the CSV file to analyze
     """
     if not os.path.exists(csv_file_path):
         print(f"❌ CSV file not found: {csv_file_path}")
         return
     
     print("=" * 100)
-    print("📊 CSV COLUMN DATA TYPE ANALYZER")
+    print("📊 CSV COLUMN DATA TYPE ANALYZER (IMPROVED)")
     print("=" * 100)
     print(f"📁 File: {csv_file_path}\n")
     
@@ -76,43 +89,108 @@ def analyze_csv_columns(csv_file_path):
             print(f"   ⚠️  All values are NULL/Empty")
             inferred_type = "UNKNOWN (all null)"
             sample_values = ["N/A"]
+            max_length = None
         else:
-            # Check for datetime
-            is_datetime = pd.api.types.is_datetime64_any_dtype(df[col])
-            if is_datetime:
+            # Special handling for GPN columns - should be VARCHAR, not numeric
+            if is_gpn_column(col):
+                inferred_type = "VARCHAR (GPN)"
+                str_series = non_null_series.astype(str)
+                max_length = str_series.str.len().max()
+                sample_values = str_series.head(3).tolist()
+                print(f"   ✅ Detected as: VARCHAR (GPN column)")
+                print(f"   String length: max={max_length}")
+            
+            # Special handling for user name columns - should be VARCHAR, not date
+            elif is_user_name_column(col):
+                inferred_type = "VARCHAR (User Name)"
+                str_series = non_null_series.astype(str)
+                max_length = str_series.str.len().max()
+                sample_values = str_series.head(3).tolist()
+                print(f"   ✅ Detected as: VARCHAR (User Name column)")
+                print(f"   String length: max={max_length}")
+            
+            # Check for datetime (only for date-like column names)
+            elif is_date_column(col) and pd.api.types.is_datetime64_any_dtype(df[col]):
                 inferred_type = "DATETIME"
                 sample_values = non_null_series.head(3).astype(str).tolist()
+                max_length = None
                 print(f"   ✅ Detected as: DATETIME")
+            
+            # Check for datetime string (only for date-like column names)
+            elif is_date_column(col) and pandas_dtype == 'object':
+                # Try to parse as date
+                str_series = non_null_series.astype(str)
+                try:
+                    test_dates = pd.to_datetime(str_series.head(100), errors='coerce')
+                    if test_dates.notna().sum() > len(test_dates) * 0.8:  # 80% parseable
+                        inferred_type = "DATETIME (string)"
+                        max_length = str_series.str.len().max()
+                        sample_values = str_series.head(3).tolist()
+                        print(f"   ✅ Detected as: DATETIME (stored as string)")
+                    else:
+                        # Not a date, treat as string
+                        inferred_type = "STRING/VARCHAR"
+                        max_length = str_series.str.len().max()
+                        sample_values = str_series.head(3).tolist()
+                        print(f"   ✅ Detected as: STRING/VARCHAR")
+                except:
+                    inferred_type = "STRING/VARCHAR"
+                    max_length = str_series.str.len().max()
+                    sample_values = str_series.head(3).tolist()
+                    print(f"   ✅ Detected as: STRING/VARCHAR")
+            
             # Check for boolean
             elif pandas_dtype == 'bool' or (pandas_dtype == 'object' and 
-                    non_null_series.astype(str).str.lower().isin(['true', 'false', '1', '0', 'yes', 'no']).all()):
-                inferred_type = "BOOLEAN"
-                unique_vals = non_null_series.unique()[:5]
-                sample_values = [str(v) for v in unique_vals]
-                print(f"   ✅ Detected as: BOOLEAN")
+                    non_null_series.astype(str).str.lower().isin(['true', 'false', '1', '0', 'yes', 'no', 't', 'f']).any()):
+                # Check if it's actually boolean
+                unique_lower = non_null_series.astype(str).str.lower().unique()
+                bool_like = all(v in ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'nan', 'none', ''] for v in unique_lower)
+                if bool_like and len(unique_lower) <= 4:
+                    inferred_type = "BOOLEAN"
+                    unique_vals = non_null_series.unique()[:5]
+                    sample_values = [str(v) for v in unique_vals]
+                    max_length = None
+                    print(f"   ✅ Detected as: BOOLEAN")
+                else:
+                    inferred_type = "STRING/VARCHAR"
+                    str_series = non_null_series.astype(str)
+                    max_length = str_series.str.len().max()
+                    sample_values = str_series.head(3).tolist()
+                    print(f"   ✅ Detected as: STRING/VARCHAR")
+            
             # Check for integer
             elif pd.api.types.is_integer_dtype(df[col]):
                 inferred_type = "INTEGER"
                 min_val = non_null_series.min()
                 max_val = non_null_series.max()
                 sample_values = non_null_series.head(3).tolist()
+                max_length = None
                 print(f"   ✅ Detected as: INTEGER")
                 print(f"   Range: {min_val} to {max_val}")
+            
             # Check for float
             elif pd.api.types.is_float_dtype(df[col]):
-                inferred_type = "FLOAT"
-                min_val = non_null_series.min()
-                max_val = non_null_series.max()
-                sample_values = non_null_series.head(3).tolist()
-                print(f"   ✅ Detected as: FLOAT")
-                print(f"   Range: {min_val:.2f} to {max_val:.2f}")
+                # Check if it's actually numeric or just NaN representation
+                if non_null_series.isna().all():
+                    inferred_type = "UNKNOWN (all null)"
+                    max_length = None
+                    sample_values = ["N/A"]
+                else:
+                    inferred_type = "FLOAT"
+                    min_val = non_null_series.min()
+                    max_val = non_null_series.max()
+                    sample_values = non_null_series.head(3).tolist()
+                    max_length = None
+                    print(f"   ✅ Detected as: FLOAT")
+                    print(f"   Range: {min_val:.2f} to {max_val:.2f}")
+            
             # Check if numeric string
             elif pandas_dtype == 'object':
                 # Try to convert to numeric
                 numeric_series = pd.to_numeric(non_null_series, errors='coerce')
                 numeric_count = numeric_series.notna().sum()
                 
-                if numeric_count == len(non_null_series):
+                if numeric_count == len(non_null_series) and numeric_count > 0:
                     # All numeric
                     if numeric_series.dtype in ['int64', 'Int64']:
                         inferred_type = "INTEGER (string)"
@@ -120,12 +198,14 @@ def analyze_csv_columns(csv_file_path):
                         max_val = numeric_series.max()
                         print(f"   ✅ Detected as: INTEGER (stored as string)")
                         print(f"   Range: {min_val} to {max_val}")
+                        max_length = None
                     else:
                         inferred_type = "FLOAT (string)"
                         min_val = numeric_series.min()
                         max_val = numeric_series.max()
                         print(f"   ✅ Detected as: FLOAT (stored as string)")
                         print(f"   Range: {min_val:.2f} to {max_val:.2f}")
+                        max_length = None
                     sample_values = non_null_series.head(3).tolist()
                 else:
                     # String type
@@ -134,24 +214,8 @@ def analyze_csv_columns(csv_file_path):
                     min_length = str_series.str.len().min()
                     avg_length = str_series.str.len().mean()
                     
-                    # Check if it looks like a date string
-                    date_like = False
-                    if any(keyword in col.lower() for keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
-                        date_like = True
-                        # Try to parse as date
-                        try:
-                            test_dates = pd.to_datetime(str_series.head(100), errors='coerce')
-                            if test_dates.notna().sum() > len(test_dates) * 0.8:  # 80% parseable
-                                inferred_type = "DATETIME (string)"
-                                print(f"   ✅ Detected as: DATETIME (stored as string)")
-                                date_like = True
-                        except:
-                            pass
-                    
-                    if not date_like:
-                        inferred_type = "STRING/VARCHAR"
-                        print(f"   ✅ Detected as: STRING/VARCHAR")
-                    
+                    inferred_type = "STRING/VARCHAR"
+                    print(f"   ✅ Detected as: STRING/VARCHAR")
                     print(f"   String length: min={min_length}, max={max_length}, avg={avg_length:.1f}")
                     
                     # Show unique value count
@@ -159,17 +223,11 @@ def analyze_csv_columns(csv_file_path):
                     print(f"   Unique values: {unique_count:,}")
                     
                     # Sample values
-                    sample_values = non_null_series.head(3).tolist()
-                    
-                    # Show most common values if not too many unique
-                    if unique_count <= 20 and unique_count > 0:
-                        print(f"   Most common values:")
-                        value_counts = non_null_series.value_counts().head(5)
-                        for val, count in value_counts.items():
-                            print(f"      '{val}': {count:,} ({count/len(non_null_series)*100:.1f}%)")
+                    sample_values = str_series.head(3).tolist()
             else:
                 inferred_type = f"UNKNOWN ({pandas_dtype})"
                 sample_values = non_null_series.head(3).tolist()
+                max_length = None
         
         # Show sample values
         print(f"   Sample values:")
@@ -187,19 +245,20 @@ def analyze_csv_columns(csv_file_path):
             'non_null': non_null_count,
             'null': null_count,
             'null_pct': null_percentage,
-            'max_length': max_length if inferred_type == "STRING/VARCHAR" else None
+            'max_length': max_length
         })
     
     # Summary table
     print("\n" + "=" * 100)
     print("SUMMARY TABLE")
     print("=" * 100)
-    print(f"{'Column Name':<40} {'Pandas Type':<15} {'Inferred Type':<20} {'Non-Null':<12} {'Null %':<10}")
+    print(f"{'Column Name':<40} {'Pandas Type':<15} {'Inferred Type':<25} {'Non-Null':<12} {'Null %':<10}")
     print("-" * 100)
     
     for r in results:
         col_name = r['column'][:38] + ".." if len(r['column']) > 40 else r['column']
-        print(f"{col_name:<40} {r['pandas_dtype']:<15} {r['inferred_type']:<20} {r['non_null']:<12,} {r['null_pct']:<10.1f}")
+        inferred = r['inferred_type'][:23] + ".." if len(r['inferred_type']) > 25 else r['inferred_type']
+        print(f"{col_name:<40} {r['pandas_dtype']:<15} {inferred:<25} {r['non_null']:<12,} {r['null_pct']:<10.1f}")
     
     # PostgreSQL type recommendations
     print("\n" + "=" * 100)
@@ -211,15 +270,15 @@ def analyze_csv_columns(csv_file_path):
         inferred = r['inferred_type']
         max_len = r['max_length']
         
-        if inferred == "DATETIME" or inferred == "DATETIME (string)":
+        if "DATETIME" in inferred:
             pg_type = "TIMESTAMP"
-        elif inferred == "BOOLEAN":
+        elif "BOOLEAN" in inferred:
             pg_type = "BOOLEAN or BIT(1)"
-        elif inferred == "INTEGER" or inferred == "INTEGER (string)":
+        elif "INTEGER" in inferred and "string" not in inferred:
             pg_type = "INTEGER"
-        elif inferred == "FLOAT" or inferred == "FLOAT (string)":
+        elif "FLOAT" in inferred and "string" not in inferred:
             pg_type = "DOUBLE PRECISION"
-        elif inferred == "STRING/VARCHAR":
+        elif "VARCHAR" in inferred or "STRING" in inferred:
             if max_len and max_len <= 50:
                 pg_type = f"VARCHAR({max_len + 10})"
             elif max_len and max_len <= 255:
