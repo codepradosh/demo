@@ -444,10 +444,40 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                         try:
                             alt_result = pd.to_datetime(normalized[null_mask], format=fmt, errors='coerce')
                             # Fix dtype compatibility - ensure both are timezone-naive (PostgreSQL TIMESTAMP is timezone-naive)
-                            if alt_result.dtype.tz is not None:
-                                alt_result = alt_result.dt.tz_localize(None)
-                            if result.dtype.tz is not None:
-                                result = result.dt.tz_localize(None)
+                            # Check if timezone-aware - use proper method to check timezone
+                            try:
+                                # Check if result is timezone-aware by checking dtype string representation
+                                if hasattr(result, 'dtype'):
+                                    dtype_str = str(result.dtype)
+                                    # DatetimeTZDtype shows as 'datetime64[ns, UTC]' or similar
+                                    if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
+                                        result = result.dt.tz_localize(None)
+                                    # Also try direct attribute access with exception handling
+                                    elif hasattr(result.dtype, 'tz'):
+                                        try:
+                                            if result.dtype.tz is not None:
+                                                result = result.dt.tz_localize(None)
+                                        except (AttributeError, TypeError):
+                                            pass
+                            except (AttributeError, TypeError, ValueError) as e:
+                                logging.debug(f"      Timezone check for result: {e}")
+                                pass
+                            
+                            try:
+                                # Check if alt_result is timezone-aware
+                                if hasattr(alt_result, 'dtype'):
+                                    dtype_str = str(alt_result.dtype)
+                                    if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
+                                        alt_result = alt_result.dt.tz_localize(None)
+                                    elif hasattr(alt_result.dtype, 'tz'):
+                                        try:
+                                            if alt_result.dtype.tz is not None:
+                                                alt_result = alt_result.dt.tz_localize(None)
+                                        except (AttributeError, TypeError):
+                                            pass
+                            except (AttributeError, TypeError, ValueError) as e:
+                                logging.debug(f"      Timezone check for alt_result: {e}")
+                                pass
                             
                             # Use proper assignment to avoid dtype warnings
                             # Create new series with updated values
@@ -461,8 +491,22 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             continue
                 
                 # Ensure final result is timezone-naive
-                if result.dtype.tz is not None:
-                    result = result.dt.tz_localize(None)
+                try:
+                    if hasattr(result, 'dtype'):
+                        dtype_str = str(result.dtype)
+                        # Check if timezone-aware by string representation
+                        if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
+                            result = result.dt.tz_localize(None)
+                        # Also try direct attribute access
+                        elif hasattr(result.dtype, 'tz'):
+                            try:
+                                if result.dtype.tz is not None:
+                                    result = result.dt.tz_localize(None)
+                            except (AttributeError, TypeError):
+                                pass
+                except (AttributeError, TypeError, ValueError) as e:
+                    logging.debug(f"      Final timezone check: {e}")
+                    pass
                 
                 return result
             except Exception as e:
@@ -495,15 +539,32 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                 if df[col].dtype == 'object':
                     try:
                         initial_non_null = df[col].notna().sum()
+                        # Store original values before parsing for debugging failed values
+                        original_values = df[col].copy() if initial_non_null > 0 else None
+                        
                         # Parse datetime and ensure timezone-naive (PostgreSQL TIMESTAMP without timezone)
                         parsed_result = parse_datetime_robust(df[col])
                         
                         # Convert to timezone-naive if timezone-aware (PostgreSQL TIMESTAMP is timezone-naive)
-                        if hasattr(parsed_result, 'dt') and parsed_result.dtype.tz is not None:
-                            parsed_result = parsed_result.dt.tz_localize(None)
-                        elif hasattr(parsed_result, 'dtype') and parsed_result.dtype.tz is not None:
-                            # For Series
-                            parsed_result = parsed_result.dt.tz_localize(None)
+                        # Use safe attribute checking to avoid errors
+                        try:
+                            if hasattr(parsed_result, 'dtype'):
+                                dtype_str = str(parsed_result.dtype)
+                                # Check if it's a DatetimeTZDtype (timezone-aware) by checking dtype string
+                                # DatetimeTZDtype shows as 'datetime64[ns, UTC]' or similar
+                                if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
+                                    # It's timezone-aware, convert to naive
+                                    parsed_result = parsed_result.dt.tz_localize(None)
+                                # Also try direct attribute access with exception handling
+                                elif hasattr(parsed_result.dtype, 'tz'):
+                                    try:
+                                        if parsed_result.dtype.tz is not None:
+                                            parsed_result = parsed_result.dt.tz_localize(None)
+                                    except (AttributeError, TypeError):
+                                        pass
+                        except (AttributeError, TypeError, ValueError) as tz_error:
+                            # If conversion fails, log but continue
+                            logging.debug(f"      Timezone conversion check for {col}: {tz_error}")
                         
                         # Assign to dataframe
                         df[col] = parsed_result
@@ -518,9 +579,20 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             # Try basic conversion as fallback
                             try:
                                 fallback_result = pd.to_datetime(df[col], errors='coerce')
-                                # Ensure timezone-naive
-                                if hasattr(fallback_result, 'dt') and fallback_result.dtype.tz is not None:
-                                    fallback_result = fallback_result.dt.tz_localize(None)
+                                # Ensure timezone-naive - use safe checking
+                                try:
+                                    if hasattr(fallback_result, 'dtype'):
+                                        dtype_str = str(fallback_result.dtype)
+                                        if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
+                                            fallback_result = fallback_result.dt.tz_localize(None)
+                                        elif hasattr(fallback_result.dtype, 'tz'):
+                                            try:
+                                                if fallback_result.dtype.tz is not None:
+                                                    fallback_result = fallback_result.dt.tz_localize(None)
+                                            except (AttributeError, TypeError):
+                                                pass
+                                except (AttributeError, TypeError, ValueError):
+                                    pass
                                 df[col] = fallback_result
                                 retry_parsed = df[col].notna().sum()
                                 if retry_parsed > 0:
@@ -531,6 +603,20 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             failed_count = total_count - parsed_count
                             date_conversion_stats['partial'] += 1
                             logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
+                            
+                            # Log sample of failed values for debugging (first 5 unique failed values)
+                            try:
+                                if original_values is not None:
+                                    failed_mask = df[col].isna()
+                                    if failed_mask.any():
+                                        # Get original values that failed to parse
+                                        failed_original = original_values[failed_mask]
+                                        if len(failed_original) > 0:
+                                            failed_samples = failed_original.astype(str).dropna().unique()[:5]
+                                            if len(failed_samples) > 0:
+                                                logging.warning(f"      Sample failed values: {list(failed_samples)}")
+                            except Exception as sample_error:
+                                logging.debug(f"      Could not get failed samples: {sample_error}")
                         elif parsed_count > 0:
                             date_conversion_stats['success'] += 1
                             logging.info(f"   ✓ Converted {col} to datetime ({parsed_count:,} values)")
@@ -545,9 +631,14 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                         # Try basic conversion as fallback
                         try:
                             fallback_result = pd.to_datetime(df[col], errors='coerce')
-                            # Ensure timezone-naive
-                            if hasattr(fallback_result, 'dt') and fallback_result.dtype.tz is not None:
-                                fallback_result = fallback_result.dt.tz_localize(None)
+                            # Ensure timezone-naive - use safe checking
+                            try:
+                                if hasattr(fallback_result, 'dtype'):
+                                    dtype = fallback_result.dtype
+                                    if str(dtype).startswith('datetime64[ns,') or (hasattr(dtype, 'tz') and dtype.tz is not None):
+                                        fallback_result = fallback_result.dt.tz_localize(None)
+                            except (AttributeError, TypeError, ValueError):
+                                pass
                             df[col] = fallback_result
                             logging.info(f"      ✓ Fallback conversion attempted")
                         except Exception as fallback_error:
