@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Push categorized incident CSV file to PostgreSQL table Incident_Data
-Usage: python push_incidents_to_postgres.py <csv_file_path> [--truncate]
+Validate that database table incident_data matches the CSV file.
+Compares row counts, column counts, and actual values to identify discrepancies.
+
+Usage: python validate_csv_vs_database.py <csv_file_path> [--table-name incident_data] [--output report.txt]
 """
 
 import os
@@ -10,1219 +12,430 @@ import sys
 import pandas as pd
 import traceback
 import logging
-import re
 from datetime import datetime
 import argparse
 from urllib.parse import quote_plus
-
-# Progress bar
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-    # Fallback: create a dummy tqdm that does nothing
-    class tqdm:
-        def __init__(self, *args, **kwargs):
-            pass
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def update(self, n):
-            pass
-        def set_postfix(self, *args, **kwargs):
-            pass
+from dotenv import load_dotenv
 
 # PostgreSQL client
 try:
     import psycopg2
     from sqlalchemy import create_engine, text, inspect
-    from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
     print("ERROR: PostgreSQL libraries not available.")
-    print("Please install: pip install psycopg2-binary sqlalchemy pandas")
+    print("Please install: pip install psycopg2-binary sqlalchemy pandas python-dotenv")
     sys.exit(1)
 
 # ------------------------------------------------------------------------
 # Logging Configuration
 # ------------------------------------------------------------------------
 def setup_logging(log_file=None):
-    """
-    Set up logging configuration to both console and file.
-    
-    Parameters
-    ----------
-    log_file : str, optional
-        Path to log file. If None, creates a timestamped log file.
-    """
-    # Create log file name with timestamp if not provided
+    """Set up logging configuration to both console and file."""
     if log_file is None:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file = f"push_incidents_to_postgres_{timestamp}.log"
+        log_file = f"validate_csv_db_{timestamp}.log"
     
-    # Ensure log directory exists
     log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else '.'
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
     
-    # Create formatters
-    detailed_formatter = logging.Formatter(
+    formatter = logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    
-    # Remove existing handlers to avoid duplicates
     root_logger.handlers = []
     
-    # Console handler (stdout)
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(detailed_formatter)
+    console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
     
     # File handler
     try:
         file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)  # More detailed in file
-        file_handler.setFormatter(detailed_formatter)
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
-        
-        # Note: Can't use logging.info here as logger might not be fully set up yet
         print(f"📝 Logging to file: {os.path.abspath(log_file)}")
     except Exception as e:
         print(f"⚠️  Could not create log file '{log_file}': {e}")
-        print("   Continuing with console logging only...")
     
     return log_file
 
 # ------------------------------------------------------------------------
-# PostgreSQL Configuration
+# Database Connection
 # ------------------------------------------------------------------------
-POSTGRES_CONFIG = {
-    'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
-    'port': os.getenv('PGPORT', '5432'),
-    'database': os.getenv('PGDATABASE', 'service_automation_db'),
-    'user': os.getenv('PGUSER', 'powerbi_user'),
-    'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'incident_data'  # Changed to lowercase incident_data
-}
-
-# ------------------------------------------------------------------------
-# Data Type Inference
-# ------------------------------------------------------------------------
-def infer_postgres_type(series, col_name):
-    """
-    Infer PostgreSQL data type from pandas Series.
+def create_db_connection(database=None, user=None, host=None, port=None, password=None):
+    """Create PostgreSQL database connection."""
+    # Load environment variables
+    load_dotenv()
     
-    Parameters
-    ----------
-    series : pd.Series
-        The pandas Series to analyze
-    col_name : str
-        Column name (for special handling)
-    
-    Returns
-    -------
-    sqlalchemy.types.TypeEngine
-        SQLAlchemy type for PostgreSQL
-    """
-    # Remove null values for type inference
-    non_null = series.dropna()
-    
-    if len(non_null) == 0:
-        # All nulls - default to Text
-        return Text
-    
-    # Check for boolean
-    if series.dtype == 'bool' or non_null.dtype == 'bool':
-        return Boolean
-    
-    # Check for datetime
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return DateTime
-    
-    # Check for date
-    if pd.api.types.is_datetime64_any_dtype(series) and 'date' in col_name.lower():
-        # Try to parse as date if it's a date column
-        try:
-            pd.to_datetime(non_null.iloc[0])
-            return Date
-        except:
-            pass
-    
-    # Check for integer
-    if pd.api.types.is_integer_dtype(series):
-        # Check if values fit in regular integer or need bigint
-        if non_null.abs().max() < 2147483647:  # PostgreSQL INTEGER max
-            return Integer
-        else:
-            return BigInteger
-    
-    # Check for float
-    if pd.api.types.is_float_dtype(series):
-        return Float
-    
-    # Check if numeric string can be converted to int
-    if series.dtype == 'object':
-        # Try to convert to numeric
-        try:
-            numeric_series = pd.to_numeric(non_null, errors='coerce')
-            if numeric_series.notna().sum() == len(non_null):
-                # All values are numeric
-                if numeric_series.abs().max() < 2147483647:
-                    return Integer
-                else:
-                    return BigInteger
-        except:
-            pass
-    
-    # Check string length for VARCHAR vs TEXT
-    if series.dtype == 'object':
-        max_length = non_null.astype(str).str.len().max()
-        if max_length > 0 and max_length < 255:
-            # Use VARCHAR with some buffer
-            return String(max_length + 50)  # Add 50 char buffer
-        else:
-            return Text
-    
-    # Default to Text
-    return Text
-
-def create_table_from_dataframe(engine, df, table_name, schema='public'):
-    """
-    Create PostgreSQL table from DataFrame with inferred data types.
-    
-    Parameters
-    ----------
-    engine : sqlalchemy.engine.Engine
-        SQLAlchemy engine
-    df : pd.DataFrame
-        DataFrame to create table from
-    table_name : str
-        Table name (will be created in lowercase)
-    schema : str
-        Schema name (default: 'public')
-    
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    try:
-        logging.info(f"\n{'='*80}")
-        logging.info(f"📋 CREATING TABLE: {table_name}")
-        logging.info(f"{'='*80}")
-        
-        # Infer column types
-        column_types = {}
-        for col in df.columns:
-            pg_type = infer_postgres_type(df[col], col)
-            column_types[col] = pg_type
-            logging.info(f"   {col}: {pg_type}")
-        
-        # Build CREATE TABLE SQL
-        columns_sql = []
-        for col in df.columns:
-            pg_type = column_types[col]
-            
-            # Convert SQLAlchemy type to PostgreSQL type string
-            if pg_type == Boolean:
-                type_str = "BOOLEAN"
-            elif pg_type == Integer:
-                type_str = "INTEGER"
-            elif pg_type == BigInteger:
-                type_str = "BIGINT"
-            elif pg_type == Float:
-                type_str = "DOUBLE PRECISION"
-            elif pg_type == DateTime:
-                type_str = "TIMESTAMP"
-            elif pg_type == Date:
-                type_str = "DATE"
-            elif isinstance(pg_type, String):
-                type_str = f"VARCHAR({pg_type.length})"
-            else:
-                type_str = "TEXT"
-            
-            # Escape column name if needed
-            col_escaped = f'"{col}"'
-            columns_sql.append(f"{col_escaped} {type_str}")
-        
-        # Add created_at and updated_at timestamps
-        columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-        
-        create_table_sql = f"""
-        CREATE TABLE IF NOT EXISTS {schema}."{table_name}" (
-            {', '.join(columns_sql)}
-        );
-        """
-        
-        logging.info(f"\n⏳ Creating table '{table_name}'...")
-        with engine.connect() as conn:
-            conn.execute(text(create_table_sql))
-            conn.commit()
-        
-        logging.info(f"✅ Table '{table_name}' created successfully")
-        logging.info(f"   Columns: {len(df.columns) + 2} (including created_at, updated_at)")
-        
-        return True
-        
-    except Exception as e:
-        logging.error(f"❌ Error creating table: {e}")
-        logging.error(traceback.format_exc())
-        return False
-
-# ------------------------------------------------------------------------
-# Main Function
-# ------------------------------------------------------------------------
-def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
-                                 user=None, host=None, port=None, password=None,
-                                 truncate=False, create_table=True, log_file=None):
-    """
-    Push categorized incident CSV file to PostgreSQL table.
-    
-    Parameters
-    ----------
-    csv_file_path : str
-        Path to the categorized CSV file to import
-    table_name : str, optional
-        Target table name (default: 'Incident_Data')
-    database : str, optional
-        Database name (default: from config or 'service_automation_db')
-    user : str, optional
-        PostgreSQL username (default: from config)
-    host : str, optional
-        PostgreSQL host (default: from config)
-    port : str, optional
-        PostgreSQL port (default: from config or '5432')
-    password : str, optional
-        PostgreSQL password (default: from environment variable PGPASSWORD)
-    truncate : bool, optional
-        If True, truncate table before inserting (default: False)
-        
-    Returns
-    -------
-    bool
-        True if successful, False otherwise
-    """
-    if not POSTGRES_AVAILABLE:
-        logging.error("✗ PostgreSQL libraries not available. Cannot export to PostgreSQL.")
-        return False
-    
-    if not os.path.exists(csv_file_path):
-        logging.error(f"✗ CSV file not found: {csv_file_path}")
-        return False
-    
-    # Use provided values or fall back to config/environment
-    table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()  # Ensure lowercase
-    database = database or POSTGRES_CONFIG['database']
-    user = user or POSTGRES_CONFIG['user']
-    host = host or POSTGRES_CONFIG['host']
-    port = port or POSTGRES_CONFIG['port']
-    password = password or POSTGRES_CONFIG['password']
+    # Get connection parameters - match push_incidents_to_postgres.py configuration
+    db_host = host or os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net')
+    db_port = port or os.getenv('PGPORT', '5432')
+    db_name = database or os.getenv('PGDATABASE', 'service_automation_db')
+    db_user = user or os.getenv('PGUSER', 'powerbi_user')
+    db_password = password or os.getenv('PGPASSWORD', 'Report@123')
     
     try:
-        logging.info("="*80)
-        logging.info("📤 Pushing Incident CSV to PostgreSQL")
-        logging.info("="*80)
-        logging.info(f"   CSV file: {csv_file_path}")
-        logging.info(f"   File size: {os.path.getsize(csv_file_path) / (1024*1024):.2f} MB" if os.path.exists(csv_file_path) else "   File size: Unknown")
-        logging.info(f"   Database: {database}")
-        logging.info(f"   Table: {table_name}")
-        logging.info(f"   Host: {host}:{port}")
-        logging.info(f"   User: {user}")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Create table: {create_table}")
-        logging.info(f"   Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        if log_file:
-            logging.info(f"   Log file: {os.path.abspath(log_file)}")
-        logging.info("="*80)
-        
-        # Read CSV file
-        logging.info(f"\n⏳ Reading CSV file...")
-        try:
-            df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
-        except UnicodeDecodeError:
-            try:
-                df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
-            except:
-                df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
-        
-        logging.info(f"✓ Read {len(df):,} rows from CSV")
-        logging.info(f"✓ Columns: {len(df.columns)} ({', '.join(df.columns[:5])}...)")
-        
-        # Convert GPN columns from float64 to string (preserve values, handle NaN)
-        logging.info(f"\n⏳ Converting GPN columns from float64 to string...")
-        gpn_columns = ['resolved_by_gpn', 'assigned_to_gpn', 'caller_gpn', 'u_manager_in_charge_gpn']
-        for col in gpn_columns:
-            if col in df.columns:
-                try:
-                    initial_dtype = df[col].dtype
-                    non_null_before = df[col].notna().sum()
-                    
-                    if df[col].dtype == 'float64':
-                        # Convert float to string, handling NaN
-                        df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
-                        non_null_after = df[col].notna().sum()
-                        logging.info(f"   ✓ Converted {col} from {initial_dtype} to string (non-null: {non_null_before} -> {non_null_after})")
-                    elif df[col].dtype == 'object':
-                        # Already string, but ensure NaN handling
-                        df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
-                        logging.info(f"   ✓ Cleaned {col} (already string, handled NaN)")
-                    else:
-                        logging.warning(f"   ⚠️  {col} has unexpected dtype: {initial_dtype}")
-                except Exception as e:
-                    logging.error(f"   ❌ Error converting {col}: {e}")
-                    logging.error(traceback.format_exc())
-        
-        # Custom date parsing function to handle various formats
-        def parse_datetime_robust(series):
-            """Parse datetime with handling for various malformed formats"""
-            if series.dtype != 'object':
-                return pd.to_datetime(series, errors='coerce')
-            
-            # Convert to string and handle NaN
-            str_series = series.astype(str)
-            str_series = str_series.replace('nan', None)
-            str_series = str_series.replace('None', None)
-            str_series = str_series.replace('', None)
-            
-            # Normalize common malformed formats
-            def normalize_date(date_str):
-                if pd.isna(date_str) or date_str is None or date_str == 'None' or date_str == '':
-                    return None
-                
-                date_str = str(date_str).strip()
-                
-                # Handle format: 2026-01-1407:13:58.001+0000 (missing space)
-                # Pattern: YYYY-MM-DDHH:MM:SS.mmm+TZ
-                if re.match(r'^\d{4}-\d{2}-\d{2}\d{2}:\d{2}:\d{2}', date_str):
-                    # Insert space between date and time
-                    date_str = re.sub(r'^(\d{4}-\d{2}-\d{2})(\d{2}:\d{2}:\d{2})', r'\1 \2', date_str)
-                
-                # Handle format: 2026-01-14 07:13:58:57+00:00 (colon instead of dot for milliseconds)
-                # Pattern: YYYY-MM-DD HH:MM:SS:mmm+TZ or YYYY-MM-DD HH:MM:SS:mmm+TZ:ZZ
-                # Replace colon before timezone (but not the timezone colon) with dot
-                # Match pattern: HH:MM:SS:mmm followed by timezone
-                if re.search(r'\d{2}:\d{2}:\d{2}:\d{1,3}[+-]', date_str):
-                    # Replace the colon between seconds and milliseconds (before timezone)
-                    date_str = re.sub(r'(\d{2}:\d{2}:\d{2}):(\d{1,3})([+-])', r'\1.\2\3', date_str)
-                
-                # Normalize timezone format: +0000 to +00:00
-                if re.search(r'[+-]\d{4}$', date_str):
-                    # Format: +0000 or -0500 at the end
-                    date_str = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', date_str)
-                
-                return date_str
-            
-            # Apply normalization
-            normalized = str_series.apply(normalize_date)
-            
-            # Try parsing with multiple formats
-            try:
-                # First try with pandas default parser (removed infer_datetime_format - deprecated)
-                result = pd.to_datetime(normalized, errors='coerce')
-                
-                # Check if we have any nulls that might be parseable with different format
-                null_mask = result.isna()
-                if null_mask.any():
-                    # Try alternative parsing for null values
-                    for fmt in [
-                        '%Y-%m-%d %H:%M:%S.%f%z',
-                        '%Y-%m-%d %H:%M:%S%z',
-                        '%Y-%m-%d %H:%M:%S',
-                        '%Y-%m-%dT%H:%M:%S.%f%z',
-                        '%Y-%m-%dT%H:%M:%S%z',
-                    ]:
-                        try:
-                            alt_result = pd.to_datetime(normalized[null_mask], format=fmt, errors='coerce')
-                            # Fix dtype compatibility - ensure both are timezone-naive (PostgreSQL TIMESTAMP is timezone-naive)
-                            # Check if timezone-aware - use proper method to check timezone
-                            try:
-                                # Check if result is timezone-aware by checking dtype string representation
-                                if hasattr(result, 'dtype'):
-                                    dtype_str = str(result.dtype)
-                                    # DatetimeTZDtype shows as 'datetime64[ns, UTC]' or similar
-                                    if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
-                                        result = result.dt.tz_localize(None)
-                                    # Also try direct attribute access with exception handling
-                                    elif hasattr(result.dtype, 'tz'):
-                                        try:
-                                            if result.dtype.tz is not None:
-                                                result = result.dt.tz_localize(None)
-                                        except (AttributeError, TypeError):
-                                            pass
-                            except (AttributeError, TypeError, ValueError) as e:
-                                logging.debug(f"      Timezone check for result: {e}")
-                                pass
-                            
-                            try:
-                                # Check if alt_result is timezone-aware
-                                if hasattr(alt_result, 'dtype'):
-                                    dtype_str = str(alt_result.dtype)
-                                    if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
-                                        alt_result = alt_result.dt.tz_localize(None)
-                                    elif hasattr(alt_result.dtype, 'tz'):
-                                        try:
-                                            if alt_result.dtype.tz is not None:
-                                                alt_result = alt_result.dt.tz_localize(None)
-                                        except (AttributeError, TypeError):
-                                            pass
-                            except (AttributeError, TypeError, ValueError) as e:
-                                logging.debug(f"      Timezone check for alt_result: {e}")
-                                pass
-                            
-                            # Use proper assignment to avoid dtype warnings
-                            # Create new series with updated values
-                            result = result.copy()
-                            result.loc[null_mask] = alt_result
-                            null_mask = result.isna()
-                            if not null_mask.any():
-                                break
-                        except Exception as fmt_error:
-                            logging.debug(f"      Format {fmt} failed: {fmt_error}")
-                            continue
-                
-                # Ensure final result is timezone-naive
-                try:
-                    if hasattr(result, 'dtype'):
-                        dtype_str = str(result.dtype)
-                        # Check if timezone-aware by string representation
-                        if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
-                            result = result.dt.tz_localize(None)
-                        # Also try direct attribute access
-                        elif hasattr(result.dtype, 'tz'):
-                            try:
-                                if result.dtype.tz is not None:
-                                    result = result.dt.tz_localize(None)
-                            except (AttributeError, TypeError):
-                                pass
-                except (AttributeError, TypeError, ValueError) as e:
-                    logging.debug(f"      Final timezone check: {e}")
-                    pass
-                
-                return result
-            except Exception as e:
-                logging.warning(f"   ⚠️  Date parsing error: {e}, using fallback")
-                return pd.to_datetime(normalized, errors='coerce')
-        
-        # Convert date columns to datetime if they're strings
-        # Exclude duration columns and user/GPN columns from date parsing
-        exclude_from_dates = ['business_duration', 'calendar_duration', 'time_worked', 
-                             'opened_by_user_name', 'opened_by_gpn', 'assigned_to_user_name', 
-                             'assigned_to_gpn', 'caller_user_name', 'caller_gpn', 
-                             'resolved_by_user_name', 'resolved_by_gpn', 'sys_updated_by',
-                             'u_manager_in_charge_user_name', 'u_manager_in_charge_gpn']
-        
-        logging.info(f"\n⏳ Converting date columns to datetime...")
-        logging.info(f"   Excluding from date parsing: {len(exclude_from_dates)} columns")
-        
-        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
-                        'created_on', 'updated_on', 'opened_date', 'closed_date']
-        date_conversion_stats = {'success': 0, 'partial': 0, 'failed': 0, 'skipped': 0}
-        
-        for col in df.columns:
-            # Skip excluded columns
-            if col in exclude_from_dates:
-                date_conversion_stats['skipped'] += 1
-                logging.debug(f"   ⏭️  Skipped {col} (excluded from date parsing)")
-                continue
-            # Only process date-like columns
-            if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
-                if df[col].dtype == 'object':
-                    try:
-                        initial_non_null = df[col].notna().sum()
-                        # Store original values before parsing for debugging failed values
-                        original_values = df[col].copy() if initial_non_null > 0 else None
-                        
-                        # Parse datetime and ensure timezone-naive (PostgreSQL TIMESTAMP without timezone)
-                        parsed_result = parse_datetime_robust(df[col])
-                        
-                        # Convert to timezone-naive if timezone-aware (PostgreSQL TIMESTAMP is timezone-naive)
-                        # Use safe attribute checking to avoid errors
-                        try:
-                            if hasattr(parsed_result, 'dtype'):
-                                dtype_str = str(parsed_result.dtype)
-                                # Check if it's a DatetimeTZDtype (timezone-aware) by checking dtype string
-                                # DatetimeTZDtype shows as 'datetime64[ns, UTC]' or similar
-                                if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
-                                    # It's timezone-aware, convert to naive
-                                    parsed_result = parsed_result.dt.tz_localize(None)
-                                # Also try direct attribute access with exception handling
-                                elif hasattr(parsed_result.dtype, 'tz'):
-                                    try:
-                                        if parsed_result.dtype.tz is not None:
-                                            parsed_result = parsed_result.dt.tz_localize(None)
-                                    except (AttributeError, TypeError):
-                                        pass
-                        except (AttributeError, TypeError, ValueError) as tz_error:
-                            # If conversion fails, log but continue
-                            logging.debug(f"      Timezone conversion check for {col}: {tz_error}")
-                        
-                        # Assign to dataframe
-                        df[col] = parsed_result
-                        
-                        # Check how many were successfully parsed
-                        parsed_count = df[col].notna().sum()
-                        total_count = len(df[col])
-                        
-                        if parsed_count == 0 and initial_non_null > 0:
-                            date_conversion_stats['failed'] += 1
-                            logging.error(f"   ❌ {col}: Failed to parse any values (had {initial_non_null:,} non-null)")
-                            # Try basic conversion as fallback
-                            try:
-                                fallback_result = pd.to_datetime(df[col], errors='coerce')
-                                # Ensure timezone-naive - use safe checking
-                                try:
-                                    if hasattr(fallback_result, 'dtype'):
-                                        dtype_str = str(fallback_result.dtype)
-                                        if 'datetime64[ns,' in dtype_str and ']' in dtype_str:
-                                            fallback_result = fallback_result.dt.tz_localize(None)
-                                        elif hasattr(fallback_result.dtype, 'tz'):
-                                            try:
-                                                if fallback_result.dtype.tz is not None:
-                                                    fallback_result = fallback_result.dt.tz_localize(None)
-                                            except (AttributeError, TypeError):
-                                                pass
-                                except (AttributeError, TypeError, ValueError):
-                                    pass
-                                df[col] = fallback_result
-                                retry_parsed = df[col].notna().sum()
-                                if retry_parsed > 0:
-                                    logging.info(f"      ✓ Fallback parsing succeeded: {retry_parsed:,} values")
-                            except Exception as fallback_error:
-                                logging.error(f"      ❌ Fallback parsing also failed: {fallback_error}")
-                        elif parsed_count < total_count and initial_non_null > 0:
-                            failed_count = total_count - parsed_count
-                            date_conversion_stats['partial'] += 1
-                            
-                            # Check if failures are just null/empty values (expected)
-                            try:
-                                if original_values is not None:
-                                    failed_mask = df[col].isna()
-                                    if failed_mask.any():
-                                        # Get original values that failed to parse
-                                        failed_original = original_values[failed_mask]
-                                        if len(failed_original) > 0:
-                                            failed_samples = failed_original.astype(str).dropna().unique()[:5]
-                                            # Check if all failures are just null/empty
-                                            all_nulls = all(
-                                                str(s).lower().strip() in ['nan', 'none', 'null', '', 'nat'] 
-                                                for s in failed_samples
-                                            )
-                                            if all_nulls and len(failed_samples) <= 1:
-                                                # These are just null values, which is expected
-                                                logging.info(f"   ✓ {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} were null/empty - expected)")
-                                            else:
-                                                # Actual parsing failures
-                                                logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
-                                                if len(failed_samples) > 0:
-                                                    logging.warning(f"      Sample failed values: {list(failed_samples)}")
-                            except Exception as sample_error:
-                                logging.debug(f"      Could not analyze failed samples: {sample_error}")
-                                logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
-                        elif parsed_count > 0:
-                            date_conversion_stats['success'] += 1
-                            logging.info(f"   ✓ Converted {col} to datetime ({parsed_count:,} values)")
-                        else:
-                            date_conversion_stats['skipped'] += 1
-                            logging.debug(f"   ⏭️  {col}: All null, skipped")
-                    except Exception as e:
-                        date_conversion_stats['failed'] += 1
-                        logging.error(f"   ❌ Error converting {col} to datetime: {e}")
-                        logging.error(f"      Exception type: {type(e).__name__}")
-                        logging.error(traceback.format_exc())
-                        # Try basic conversion as fallback
-                        try:
-                            fallback_result = pd.to_datetime(df[col], errors='coerce')
-                            # Ensure timezone-naive - use safe checking
-                            try:
-                                if hasattr(fallback_result, 'dtype'):
-                                    dtype = fallback_result.dtype
-                                    if str(dtype).startswith('datetime64[ns,') or (hasattr(dtype, 'tz') and dtype.tz is not None):
-                                        fallback_result = fallback_result.dt.tz_localize(None)
-                            except (AttributeError, TypeError, ValueError):
-                                pass
-                            df[col] = fallback_result
-                            logging.info(f"      ✓ Fallback conversion attempted")
-                        except Exception as fallback_error:
-                            logging.error(f"      ❌ Fallback conversion failed: {fallback_error}")
-        
-        logging.info(f"   Date conversion summary: {date_conversion_stats['success']} successful, "
-                    f"{date_conversion_stats['partial']} partial, {date_conversion_stats['failed']} failed, "
-                    f"{date_conversion_stats['skipped']} skipped")
-        
-        # Convert boolean columns (handle BIT fields)
-        # Note: made_sla and knowledge are VARCHAR in the database, so only convert 'active'
-        logging.info(f"\n⏳ Converting boolean columns...")
-        bool_columns = ['active']  # made_sla and knowledge are VARCHAR, not boolean
-        for col in bool_columns:
-            if col in df.columns:
-                try:
-                    initial_dtype = df[col].dtype
-                    initial_non_null = df[col].notna().sum()
-                    
-                    if df[col].dtype == 'object':
-                        # Check if it's already boolean-like
-                        non_null = df[col].dropna()
-                        if len(non_null) > 0:
-                            unique_vals = non_null.astype(str).str.lower().unique()
-                            # Check if values are boolean-like
-                            bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off', '']
-                            bool_like = all(v.strip() in bool_like_values for v in unique_vals)
-                            
-                            if bool_like and len(unique_vals) <= 4:
-                                # Convert to boolean
-                                df[col] = df[col].astype(str).str.lower().str.strip().isin(['true', '1', 'yes', 'y', 't', 'on'])
-                                final_non_null = df[col].notna().sum()
-                                logging.info(f"   ✓ Converted {col} to boolean (non-null: {initial_non_null} -> {final_non_null}, unique values: {list(unique_vals)})")
-                            else:
-                                # Not boolean-like, keep as is (shouldn't happen for 'active', but handle gracefully)
-                                logging.warning(f"   ⚠️  {col} contains non-boolean values: {list(unique_vals[:5])}, keeping as string")
-                        else:
-                            # All null, set to boolean with all False
-                            df[col] = False
-                            logging.info(f"   ✓ Set {col} to boolean (all False, was all null)")
-                    else:
-                        df[col] = df[col].astype(bool)
-                        final_non_null = df[col].notna().sum()
-                        logging.info(f"   ✓ Converted {col} from {initial_dtype} to boolean (non-null: {initial_non_null} -> {final_non_null})")
-                except Exception as e:
-                    logging.error(f"   ❌ Error converting {col} to boolean: {e}")
-                    logging.error(traceback.format_exc())
-        
-        # Convert integer columns
-        logging.info(f"\n⏳ Converting integer columns...")
-        int_columns = ['reassignment_count', 'reopen_count']
-        for col in int_columns:
-            if col in df.columns:
-                try:
-                    initial_dtype = df[col].dtype
-                    initial_non_null = df[col].notna().sum()
-                    df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
-                    final_non_null = df[col].notna().sum()
-                    logging.info(f"   ✓ Converted {col} from {initial_dtype} to Int64 (non-null: {initial_non_null} -> {final_non_null})")
-                except Exception as e:
-                    logging.error(f"   ❌ Error converting {col} to integer: {e}")
-                    logging.error(traceback.format_exc())
-        
-        # Keep duration fields as VARCHAR (don't convert to numeric or dates)
-        # These should remain as strings per schema: time_worked, business_duration, calendar_duration
-        logging.info(f"\n⏳ Ensuring duration columns are treated as strings...")
-        duration_columns = ['time_worked', 'business_duration', 'calendar_duration']
-        for col in duration_columns:
-            if col in df.columns:
-                try:
-                    initial_dtype = df[col].dtype
-                    initial_non_null = df[col].notna().sum()
-                    
-                    # Convert to string, handling all data types
-                    if df[col].dtype == 'float64':
-                        # Convert float to string, handling NaN
-                        df[col] = df[col].astype('Int64').astype(str).replace('<NA>', None).replace('nan', None)
-                    else:
-                        df[col] = df[col].astype(str).replace('nan', None).replace('None', None)
-                    
-                    final_non_null = df[col].notna().sum()
-                    logging.info(f"   ✓ Ensured {col} is treated as string (dtype: {initial_dtype} -> object, non-null: {initial_non_null} -> {final_non_null})")
-                except Exception as e:
-                    logging.error(f"   ❌ Error converting {col} to string: {e}")
-                    logging.error(traceback.format_exc())
-        
-        # Create connection string with URL-encoded password
-        # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
-        if password:
-            # URL-encode the password to handle special characters like @
-            encoded_password = quote_plus(password)
-            connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
-        else:
-            # Try without password (trust authentication or .pgpass)
-            connection_string = f"postgresql://{user}@{host}:{port}/{database}"
-        
-        # Create SQLAlchemy engine
-        logging.info(f"\n⏳ Connecting to PostgreSQL...")
+        # Create connection string
+        connection_string = f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_name}"
         engine = create_engine(connection_string, pool_pre_ping=True)
         
         # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        logging.info(f"✓ Connected to PostgreSQL successfully")
         
-        # Check if table exists
-        logging.info(f"\n⏳ Checking if table '{table_name}' exists...")
-        inspector = inspect(engine)
-        table_exists = inspector.has_table(table_name, schema='public')
-        
-        if not table_exists:
-            if create_table:
-                logging.info(f"⚠️  Table '{table_name}' does not exist. Creating it...")
-                success = create_table_from_dataframe(engine, df, table_name)
-                if not success:
-                    logging.error(f"✗ Failed to create table '{table_name}'")
-                    engine.dispose()
-                    return False
-            else:
-                logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
-                logging.error(f"  Use --create-table to create it automatically")
-                engine.dispose()
-                return False
-        else:
-            logging.info(f"✓ Table '{table_name}' exists")
-        
-        # Get table column names
-        logging.info(f"\n⏳ Fetching table column names...")
-        table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
-        
-        col_count = len(table_columns)
-        logging.info(f"✓ Table has {col_count} columns")
-        
-        # Validate CSV columns match table columns
-        logging.info(f"\n⏳ Validating column names...")
-        
-        csv_columns = [col for col in df.columns]
-        table_columns_lower = {col.lower(): col for col in table_columns}
-        
-        # Check for resolved_by_user_name and alternative names
-        resolved_by_alternatives = ['resolved_by_user_name', 'resolved_by_name', 'resolved_by']
-        resolved_by_found = None
-        for alt in resolved_by_alternatives:
-            if alt in df.columns:
-                resolved_by_found = alt
-                logging.info(f"✓ Found resolved_by column: '{alt}'")
-                break
-        
-        if not resolved_by_found:
-            logging.warning(f"⚠️  No resolved_by column found in CSV (checked: {resolved_by_alternatives})")
-            # Check case-insensitive
-            for csv_col in csv_columns:
-                if 'resolved' in csv_col.lower() and 'by' in csv_col.lower():
-                    logging.info(f"   Found potential resolved_by column: '{csv_col}'")
-        
-        # Create column mapping (case-insensitive match)
-        column_mapping = {}
-        for csv_col in csv_columns:
-            csv_col_lower = csv_col.lower()
-            if csv_col_lower in table_columns_lower:
-                table_col = table_columns_lower[csv_col_lower]
-                if csv_col != table_col:
-                    column_mapping[csv_col] = table_col
-            # Map alternative resolved_by column names
-            elif csv_col_lower == 'resolved_by_name' and 'resolved_by_user_name' in table_columns:
-                column_mapping[csv_col] = 'resolved_by_user_name'
-                logging.info(f"   Mapping '{csv_col}' -> 'resolved_by_user_name'")
-        
-        if column_mapping:
-            df.rename(columns=column_mapping, inplace=True)
-            logging.info(f"✓ Renamed {len(column_mapping)} columns to match table case")
-        
-        # Find missing columns in CSV
-        metadata_cols = {'created_at', 'updated_at'}
-        missing_in_csv = []
-        for table_col in table_columns:
-            if table_col.lower() not in [c.lower() for c in df.columns] and table_col not in metadata_cols:
-                missing_in_csv.append(table_col)
-                df[table_col] = None
-        
-        if missing_in_csv:
-            logging.warning(f"\n⚠️  CSV is missing {len(missing_in_csv)} table columns (set to NULL):")
-            for col in missing_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(missing_in_csv) > 10:
-                logging.warning(f"   ... and {len(missing_in_csv) - 10} more")
-        
-        # Fill empty resolved_by_user_name from fallback fields (similar to daily_load_incidents.py)
-        if 'resolved_by_user_name' in df.columns:
-            initial_empty = ((df['resolved_by_user_name'].isna()) | (df['resolved_by_user_name'] == '')).sum()
-            total_count = len(df)
-            
-            if initial_empty > 0:
-                logging.info(f"\n⏳ Found {initial_empty:,}/{total_count:,} empty resolved_by_user_name values, attempting fallback...")
-                
-                # Try to fill from resolved_by_gpn if available
-                if 'resolved_by_gpn' in df.columns:
-                    empty_mask = (df['resolved_by_user_name'].isna()) | (df['resolved_by_user_name'] == '')
-                    gpn_mask = empty_mask & df['resolved_by_gpn'].notna() & (df['resolved_by_gpn'].astype(str) != '')
-                    if gpn_mask.any():
-                        df.loc[gpn_mask, 'resolved_by_user_name'] = df.loc[gpn_mask, 'resolved_by_gpn'].astype(str)
-                        logging.info(f"   ✓ Filled {gpn_mask.sum():,} values from resolved_by_gpn")
-                
-                # Try to fill from sys_updated_by if available
-                if 'sys_updated_by' in df.columns:
-                    empty_mask = (df['resolved_by_user_name'].isna()) | (df['resolved_by_user_name'] == '')
-                    updated_by_mask = empty_mask & df['sys_updated_by'].notna() & (df['sys_updated_by'].astype(str) != '')
-                    if updated_by_mask.any():
-                        df.loc[updated_by_mask, 'resolved_by_user_name'] = df.loc[updated_by_mask, 'sys_updated_by'].astype(str)
-                        logging.info(f"   ✓ Filled {updated_by_mask.sum():,} values from sys_updated_by")
-                
-                final_empty = ((df['resolved_by_user_name'].isna()) | (df['resolved_by_user_name'] == '')).sum()
-                filled_count = initial_empty - final_empty
-                if filled_count > 0:
-                    logging.info(f"   ✅ Successfully filled {filled_count:,} empty resolved_by_user_name values")
-                if final_empty > 0:
-                    logging.warning(f"   ⚠️  {final_empty:,} resolved_by_user_name values remain empty")
-            else:
-                logging.info(f"   ✓ All {total_count:,} resolved_by_user_name values are populated")
-        
-        # Find extra columns in CSV (not in table)
-        extra_in_csv = []
-        for csv_col in df.columns:
-            if csv_col not in table_columns and csv_col not in metadata_cols:
-                extra_in_csv.append(csv_col)
-        
-        if extra_in_csv:
-            logging.warning(f"\n⚠️  CSV has {len(extra_in_csv)} extra columns (will be ignored):")
-            for col in extra_in_csv[:10]:
-                logging.warning(f"   - {col}")
-            if len(extra_in_csv) > 10:
-                logging.warning(f"   ... and {len(extra_in_csv) - 10} more")
-        
-        # Filter DataFrame to only include columns that exist in table
-        columns_to_insert = [col for col in table_columns if col not in metadata_cols]
-        df_final = df[[col for col in columns_to_insert if col in df.columns]].copy()
-        
-        # Validate data types match table schema before insertion
-        logging.info(f"\n⏳ Validating data types against table schema...")
-        try:
-            with engine.connect() as conn:
-                # Get column data types from table
-                result = conn.execute(text(f"""
-                    SELECT 
-                        column_name,
-                        data_type,
-                        udt_name
-                    FROM information_schema.columns
-                    WHERE table_name = '{table_name}'
-                    AND table_schema = 'public'
-                """))
-                table_schema = {row[0]: {'data_type': row[1], 'udt_name': row[2]} for row in result.fetchall()}
-            
-            # Check for type mismatches
-            type_mismatches = []
-            for col_name in df_final.columns:
-                if col_name in table_schema:
-                    table_type = table_schema[col_name]['udt_name']
-                    table_data_type = table_schema[col_name]['data_type']
-                    
-                    # Check boolean columns - ensure they're actually boolean
-                    if table_type in ['bool', 'bit']:
-                        if col_name in df_final.columns:
-                            # Check if column has non-boolean string values
-                            non_null = df_final[col_name].dropna()
-                            if len(non_null) > 0:
-                                str_vals = non_null.astype(str).str.lower().str.strip()
-                                # Check for non-boolean values
-                                bool_values = {'true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off', ''}
-                                non_bool_mask = ~str_vals.isin(bool_values)
-                                if non_bool_mask.any():
-                                    non_bool_vals = str_vals[non_bool_mask].unique()[:5]
-                                    type_mismatches.append({
-                                        'column': col_name,
-                                        'table_type': table_data_type,
-                                        'issue': f"Contains non-boolean values: {list(non_bool_vals)}",
-                                        'count': non_bool_mask.sum()
-                                    })
-                                    # Convert non-boolean values to None or handle them
-                                    logging.warning(f"   ⚠️  {col_name}: Table expects {table_data_type}, but CSV has non-boolean values")
-                                    logging.warning(f"      Found {non_bool_mask.sum():,} non-boolean values like: {list(non_bool_vals)}")
-                                    # Set non-boolean values to None to avoid insertion errors
-                                    mask = df_final[col_name].astype(str).str.lower().str.strip().isin(bool_values) | df_final[col_name].isna()
-                                    df_final.loc[~mask, col_name] = None
-                                    logging.warning(f"      Set {non_bool_mask.sum():,} non-boolean values to NULL")
-            
-            if type_mismatches:
-                logging.warning(f"   ⚠️  Found {len(type_mismatches)} columns with type mismatches (handled)")
-            else:
-                logging.info(f"   ✓ All data types match table schema")
-        except Exception as e:
-            logging.error(f"   ❌ Error validating data types: {e}")
-            logging.error(traceback.format_exc())
-            logging.warning(f"   ⚠️  Continuing without type validation...")
-        
-        # Validate and truncate VARCHAR columns to match table constraints
-        logging.info(f"\n⏳ Validating data against table constraints...")
-        try:
-            with engine.connect() as conn:
-                # Get column information including max lengths
-                result = conn.execute(text(f"""
-                    SELECT 
-                        column_name,
-                        data_type,
-                        character_maximum_length
-                    FROM information_schema.columns
-                    WHERE table_name = '{table_name}'
-                    AND table_schema = 'public'
-                    AND character_maximum_length IS NOT NULL
-                """))
-                varchar_columns = {row[0]: row[2] for row in result.fetchall()}
-            
-            logging.info(f"   Found {len(varchar_columns)} VARCHAR columns with length constraints")
-            
-            # Truncate values that exceed VARCHAR length
-            truncated_count = 0
-            truncation_details = {}
-            
-            for col_name, max_length in varchar_columns.items():
-                if col_name in df_final.columns:
-                    try:
-                        # Check for values exceeding length
-                        mask = df_final[col_name].notna()
-                        if mask.any():
-                            str_series = df_final.loc[mask, col_name].astype(str)
-                            exceeds_mask = str_series.str.len() > max_length
-                            if exceeds_mask.any():
-                                count = exceeds_mask.sum()
-                                truncated_count += count
-                                max_exceeded = str_series.loc[exceeds_mask].str.len().max()
-                                truncation_details[col_name] = {
-                                    'count': count,
-                                    'max_length': max_length,
-                                    'max_exceeded': max_exceeded
-                                }
-                                df_final.loc[mask & exceeds_mask, col_name] = str_series.loc[exceeds_mask].str[:max_length]
-                                logging.warning(f"   ⚠️  Truncated {count:,} values in '{col_name}' (exceeded VARCHAR({max_length}), max was {max_exceeded})")
-                    except Exception as e:
-                        logging.error(f"   ❌ Error validating '{col_name}': {e}")
-                        logging.error(traceback.format_exc())
-            
-            if truncated_count > 0:
-                logging.warning(f"   ⚠️  Total truncated values: {truncated_count:,} across {len(truncation_details)} columns")
-                for col, details in truncation_details.items():
-                    logging.warning(f"      - {col}: {details['count']:,} values (max length: {details['max_exceeded']})")
-            else:
-                logging.info(f"   ✓ All VARCHAR values within constraints")
-        except Exception as e:
-            logging.error(f"   ❌ Error validating VARCHAR constraints: {e}")
-            logging.error(traceback.format_exc())
-            logging.warning(f"   ⚠️  Continuing without constraint validation...")
-        
-        # Check existing row count
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-            existing_rows = result.fetchone()[0]
-        logging.info(f"✓ Table currently has {existing_rows:,} rows")
-        
-        # Truncate table if requested
-        if truncate:
-            logging.info(f"\n⏳ Truncating table '{table_name}'...")
-            with engine.connect() as conn:
-                conn.execute(text(f'TRUNCATE TABLE "{table_name}";'))
-                conn.commit()
-            logging.info(f"✓ Table truncated")
-        
-        # Push to database with progress bar
-        total_rows = len(df_final)
-        chunksize = 1000
-        num_chunks = (total_rows + chunksize - 1) // chunksize
-        
-        logging.info(f"\n⏳ Writing {total_rows:,} rows to PostgreSQL table '{table_name}'...")
-        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
-        logging.info(f"   Columns: {len(df_final.columns)} columns matching table structure")
-        logging.info(f"   Chunk size: {chunksize:,} rows per batch")
-        logging.info(f"   Total batches: {num_chunks:,}")
-        
-        # Insert with progress bar and error handling
-        if TQDM_AVAILABLE:
-            with tqdm(total=total_rows, desc="Inserting rows", unit="row", unit_scale=True, ncols=100) as pbar:
-                for i in range(0, total_rows, chunksize):
-                    chunk_df = df_final.iloc[i:i+chunksize].copy()
-                    try:
-                        chunk_df.to_sql(
-                            name=table_name,
-                            con=engine,
-                            schema='public',
-                            if_exists='append',  # Append since we truncated if needed
-                            index=False,
-                            method='multi',  # Use multi-row INSERT for better performance
-                            chunksize=chunksize
-                        )
-                        pbar.update(len(chunk_df))
-                        # Update description with current progress
-                        pbar.set_postfix({
-                            'batch': f"{i//chunksize + 1}/{num_chunks}",
-                            'rows': f"{min(i+chunksize, total_rows):,}/{total_rows:,}"
-                        })
-                    except Exception as e:
-                        batch_num = i//chunksize + 1
-                        logging.error(f"   ❌ Error inserting batch {batch_num}/{num_chunks}: {e}")
-                        logging.error(f"      Exception type: {type(e).__name__}")
-                        logging.error(f"      Batch range: rows {i} to {min(i+chunksize, total_rows)}")
-                        logging.error(f"      Traceback: {traceback.format_exc()}")
-                        
-                        # Try inserting row by row to identify problematic rows
-                        logging.warning(f"   ⚠️  Attempting row-by-row insertion for this batch...")
-                        failed_rows = 0
-                        successful_rows = 0
-                        
-                        for idx, row in chunk_df.iterrows():
-                            try:
-                                row.to_frame().T.to_sql(
-                                    name=table_name,
-                                    con=engine,
-                                    schema='public',
-                                    if_exists='append',
-                                    index=False
-                                )
-                                pbar.update(1)
-                                successful_rows += 1
-                            except Exception as row_error:
-                                failed_rows += 1
-                                incident_num = row.get('incident_number', 'N/A')
-                                logging.error(f"   ❌ Failed to insert row {idx} (incident: {incident_num}): {row_error}")
-                                logging.error(f"      Exception type: {type(row_error).__name__}")
-                                
-                                # Log problematic column values if available
-                                if hasattr(row_error, 'args') and row_error.args:
-                                    logging.error(f"      Error details: {row_error.args[0] if row_error.args else 'N/A'}")
-                                
-                                # Only log first 5 failed rows in detail to avoid spam
-                                if failed_rows <= 5:
-                                    problem_cols = []
-                                    for col in df_final.columns:
-                                        val = row.get(col)
-                                        if pd.notna(val) and isinstance(val, str) and len(str(val)) > 100:
-                                            problem_cols.append(f"{col} (length: {len(str(val))})")
-                                    if problem_cols:
-                                        logging.error(f"      Potentially problematic columns: {', '.join(problem_cols[:3])}")
-                        
-                        if failed_rows > 0:
-                            logging.warning(f"   ⚠️  Batch {batch_num}: {failed_rows} rows failed, {successful_rows} succeeded")
-                        else:
-                            logging.info(f"   ✓ All rows in batch {batch_num} inserted successfully")
-        else:
-            # Fallback: insert without progress bar but with logging
-            logging.info("   (Install tqdm for progress bar: pip install tqdm)")
-            for i in range(0, total_rows, chunksize):
-                chunk_df = df_final.iloc[i:i+chunksize].copy()
-                try:
-                    chunk_df.to_sql(
-                        name=table_name,
-                        con=engine,
-                        schema='public',
-                        if_exists='append',  # Append since we truncated if needed
-                        index=False,
-                        method='multi',  # Use multi-row INSERT for better performance
-                        chunksize=chunksize
-                    )
-                    if (i // chunksize + 1) % 10 == 0 or i + chunksize >= total_rows:
-                        logging.info(f"   Inserted {min(i+chunksize, total_rows):,}/{total_rows:,} rows...")
-                except Exception as e:
-                    batch_num = i//chunksize + 1
-                    logging.error(f"   ❌ Error inserting batch {batch_num}/{num_chunks}: {e}")
-                    logging.error(f"      Exception type: {type(e).__name__}")
-                    logging.error(f"      Batch range: rows {i} to {min(i+chunksize, total_rows)}")
-                    logging.error(f"      Traceback: {traceback.format_exc()}")
-                    raise
-        
-        logging.info(f"✅ Insertion completed!")
-        
-        engine.dispose()
-        
-        # Verify final row count
-        logging.info(f"\n⏳ Verifying final row count...")
-        try:
-            engine = create_engine(connection_string, pool_pre_ping=True)
-            with engine.connect() as conn:
-                result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
-                final_rows = result.fetchone()[0]
-            engine.dispose()
-            logging.info(f"✓ Verified: {final_rows:,} rows in table")
-        except Exception as e:
-            logging.error(f"   ❌ Error verifying row count: {e}")
-            logging.error(traceback.format_exc())
-            final_rows = "Unknown"
-        
-        logging.info(f"\n{'='*80}")
-        logging.info("✅ SUCCESS!")
-        logging.info(f"{'='*80}")
-        logging.info(f"✓ Wrote {len(df_final):,} rows to PostgreSQL")
-        logging.info(f"✓ Database: {database}")
-        logging.info(f"✓ Table: {table_name}")
-        logging.info(f"✓ Total rows in table now: {final_rows:,}")
-        if not truncate:
-            logging.info(f"   (Previous: {existing_rows:,}, Added: {len(df_final):,})")
-        logging.info(f"{'='*80}\n")
-        
-        return True
-        
+        logging.info(f"✓ Connected to PostgreSQL: {db_host}:{db_port}/{db_name}")
+        return engine
     except Exception as e:
-        logging.error(f"\n{'='*80}")
-        logging.error("❌ FAILED TO EXPORT TO POSTGRESQL")
-        logging.error(f"{'='*80}")
-        logging.error(f"Error: {e}")
-        logging.error(f"Error type: {type(e).__name__}")
-        logging.error(f"\nFull traceback:")
+        logging.error(f"❌ Failed to connect to PostgreSQL: {e}")
         logging.error(traceback.format_exc())
-        logging.error(f"{'='*80}\n")
-        return False
+        return None
 
+# ------------------------------------------------------------------------
+# Data Comparison Functions
+# ------------------------------------------------------------------------
+def normalize_value(val):
+    """Normalize values for comparison (handle NaN, None, empty strings, etc.)."""
+    if pd.isna(val) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        # Handle float comparison (round to avoid precision issues)
+        if isinstance(val, float):
+            return round(val, 10)
+        return val
+    if isinstance(val, str):
+        # Strip whitespace and handle empty strings
+        val = val.strip()
+        return val if val else None
+    if isinstance(val, datetime):
+        # Normalize datetime to string for comparison
+        return val.strftime('%Y-%m-%d %H:%M:%S')
+    return str(val).strip() if str(val).strip() else None
+
+def compare_dataframes(csv_df, db_df, key_column='incident_number'):
+    """
+    Compare two DataFrames and return differences.
+    
+    Returns:
+        dict with comparison results
+    """
+    results = {
+        'csv_row_count': len(csv_df),
+        'db_row_count': len(db_df),
+        'missing_in_db': [],
+        'extra_in_db': [],
+        'value_mismatches': [],
+        'column_differences': {}
+    }
+    
+    # Check row counts
+    if results['csv_row_count'] != results['db_row_count']:
+        logging.warning(f"⚠️  Row count mismatch: CSV has {results['csv_row_count']:,} rows, DB has {results['db_row_count']:,} rows")
+    
+    # Check if key column exists
+    if key_column not in csv_df.columns:
+        logging.error(f"❌ Key column '{key_column}' not found in CSV")
+        return results
+    if key_column not in db_df.columns:
+        logging.error(f"❌ Key column '{key_column}' not found in database")
+        return results
+    
+    # Set index to key column for easier comparison
+    csv_df_indexed = csv_df.set_index(key_column)
+    db_df_indexed = db_df.set_index(key_column)
+    
+    # Find rows missing in database
+    csv_keys = set(csv_df_indexed.index)
+    db_keys = set(db_df_indexed.index)
+    results['missing_in_db'] = list(csv_keys - db_keys)
+    results['extra_in_db'] = list(db_keys - csv_keys)
+    
+    if results['missing_in_db']:
+        logging.warning(f"⚠️  {len(results['missing_in_db'])} rows in CSV but not in database")
+    if results['extra_in_db']:
+        logging.warning(f"⚠️  {len(results['extra_in_db'])} rows in database but not in CSV")
+    
+    # Find common columns
+    common_columns = set(csv_df.columns) & set(db_df.columns)
+    common_keys = csv_keys & db_keys
+    
+    logging.info(f"📊 Comparing {len(common_keys):,} common rows across {len(common_columns)} common columns")
+    
+    # Compare values for common rows and columns
+    mismatch_count = 0
+    max_mismatches_to_report = 100  # Limit reporting to avoid huge output
+    
+    for key in list(common_keys)[:10000]:  # Limit to first 10k for performance
+        if key in csv_df_indexed.index and key in db_df_indexed.index:
+            csv_row = csv_df_indexed.loc[key]
+            db_row = db_df_indexed.loc[key]
+            
+            for col in common_columns:
+                if col == key_column:
+                    continue
+                
+                csv_val = normalize_value(csv_row.get(col))
+                db_val = normalize_value(db_row.get(col))
+                
+                if csv_val != db_val:
+                    mismatch_count += 1
+                    if len(results['value_mismatches']) < max_mismatches_to_report:
+                        results['value_mismatches'].append({
+                            'key': key,
+                            'column': col,
+                            'csv_value': csv_val,
+                            'db_value': db_val
+                        })
+    
+    results['total_mismatches'] = mismatch_count
+    return results
+
+# ------------------------------------------------------------------------
+# Main Validation Function
+# ------------------------------------------------------------------------
+def validate_csv_vs_database(csv_file_path, table_name='incident_data', 
+                             database=None, user=None, host=None, port=None, 
+                             password=None, output_file=None):
+    """
+    Validate that database table matches CSV file.
+    
+    Parameters
+    ----------
+    csv_file_path : str
+        Path to CSV file
+    table_name : str
+        Database table name
+    database : str, optional
+        Database name
+    user : str, optional
+        Database user
+    host : str, optional
+        Database host
+    port : str, optional
+        Database port
+    password : str, optional
+        Database password
+    output_file : str, optional
+        Path to output report file
+    """
+    logging.info("=" * 80)
+    logging.info("🔍 CSV vs Database Validation")
+    logging.info("=" * 80)
+    
+    # Check CSV file exists
+    if not os.path.exists(csv_file_path):
+        logging.error(f"❌ CSV file not found: {csv_file_path}")
+        return False
+    
+    # Read CSV file
+    logging.info(f"\n📄 Reading CSV file: {csv_file_path}")
+    try:
+        csv_df = pd.read_csv(csv_file_path, low_memory=False)
+        logging.info(f"✓ Read {len(csv_df):,} rows, {len(csv_df.columns)} columns from CSV")
+        logging.info(f"   Columns: {', '.join(csv_df.columns[:10])}{'...' if len(csv_df.columns) > 10 else ''}")
+    except Exception as e:
+        logging.error(f"❌ Failed to read CSV file: {e}")
+        logging.error(traceback.format_exc())
+        return False
+    
+    # Connect to database
+    logging.info(f"\n🔌 Connecting to database...")
+    engine = create_db_connection(database, user, host, port, password)
+    if not engine:
+        return False
+    
+    # Read database table
+    logging.info(f"\n📊 Reading database table: {table_name}")
+    try:
+        with engine.connect() as conn:
+            # Check if table exists
+            inspector = inspect(engine)
+            if not inspector.has_table(table_name, schema='public'):
+                logging.error(f"❌ Table '{table_name}' does not exist in database")
+                return False
+            
+            # Get table columns
+            table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
+            logging.info(f"✓ Table has {len(table_columns)} columns")
+            
+            # Read table data
+            db_df = pd.read_sql_table(table_name, engine, schema='public')
+            logging.info(f"✓ Read {len(db_df):,} rows from database")
+            
+    except Exception as e:
+        logging.error(f"❌ Failed to read database table: {e}")
+        logging.error(traceback.format_exc())
+        return False
+    
+    # Compare column names
+    logging.info(f"\n📋 Comparing columns...")
+    csv_columns = set(csv_df.columns)
+    db_columns = set(db_df.columns)
+    
+    missing_in_db = csv_columns - db_columns
+    extra_in_db = db_columns - csv_columns
+    common_columns = csv_columns & db_columns
+    
+    if missing_in_db:
+        logging.warning(f"⚠️  {len(missing_in_db)} columns in CSV but not in database: {list(missing_in_db)[:10]}")
+    if extra_in_db:
+        logging.warning(f"⚠️  {len(extra_in_db)} columns in database but not in CSV: {list(extra_in_db)[:10]}")
+    if common_columns:
+        logging.info(f"✓ {len(common_columns)} common columns found")
+    
+    # Compare data
+    logging.info(f"\n🔍 Comparing data values...")
+    comparison_results = compare_dataframes(csv_df, db_df, key_column='incident_number')
+    
+    # Print summary
+    logging.info("\n" + "=" * 80)
+    logging.info("📊 VALIDATION SUMMARY")
+    logging.info("=" * 80)
+    logging.info(f"CSV Rows: {comparison_results['csv_row_count']:,}")
+    logging.info(f"DB Rows: {comparison_results['db_row_count']:,}")
+    logging.info(f"Common Columns: {len(common_columns)}")
+    
+    if comparison_results['missing_in_db']:
+        logging.warning(f"❌ Missing in DB: {len(comparison_results['missing_in_db']):,} rows")
+        if len(comparison_results['missing_in_db']) <= 20:
+            logging.warning(f"   Examples: {comparison_results['missing_in_db'][:10]}")
+    
+    if comparison_results['extra_in_db']:
+        logging.warning(f"⚠️  Extra in DB: {len(comparison_results['extra_in_db']):,} rows")
+        if len(comparison_results['extra_in_db']) <= 20:
+            logging.warning(f"   Examples: {comparison_results['extra_in_db'][:10]}")
+    
+    if comparison_results['total_mismatches'] > 0:
+        logging.warning(f"❌ Value Mismatches: {comparison_results['total_mismatches']:,} differences found")
+        logging.warning(f"   Showing first {len(comparison_results['value_mismatches'])} examples:")
+        for i, mismatch in enumerate(comparison_results['value_mismatches'][:20], 1):
+            logging.warning(f"   {i}. {mismatch['key']} | {mismatch['column']}:")
+            logging.warning(f"      CSV: {mismatch['csv_value']}")
+            logging.warning(f"      DB:  {mismatch['db_value']}")
+    else:
+        logging.info("✓ No value mismatches found for compared rows")
+    
+    # Write detailed report to file
+    if output_file:
+        logging.info(f"\n📝 Writing detailed report to: {output_file}")
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write("CSV vs Database Validation Report\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"CSV File: {csv_file_path}\n")
+                f.write(f"Database Table: {table_name}\n\n")
+                
+                f.write(f"CSV Rows: {comparison_results['csv_row_count']:,}\n")
+                f.write(f"DB Rows: {comparison_results['db_row_count']:,}\n\n")
+                
+                if comparison_results['missing_in_db']:
+                    f.write(f"\nMissing in DB ({len(comparison_results['missing_in_db'])} rows):\n")
+                    for key in comparison_results['missing_in_db'][:100]:
+                        f.write(f"  - {key}\n")
+                
+                if comparison_results['extra_in_db']:
+                    f.write(f"\nExtra in DB ({len(comparison_results['extra_in_db'])} rows):\n")
+                    for key in comparison_results['extra_in_db'][:100]:
+                        f.write(f"  - {key}\n")
+                
+                if comparison_results['value_mismatches']:
+                    f.write(f"\nValue Mismatches (showing first 100):\n")
+                    for mismatch in comparison_results['value_mismatches'][:100]:
+                        f.write(f"\n  Key: {mismatch['key']}\n")
+                        f.write(f"  Column: {mismatch['column']}\n")
+                        f.write(f"  CSV Value: {mismatch['csv_value']}\n")
+                        f.write(f"  DB Value: {mismatch['db_value']}\n")
+                        f.write("-" * 40 + "\n")
+            
+            logging.info(f"✓ Report written to: {output_file}")
+        except Exception as e:
+            logging.error(f"❌ Failed to write report: {e}")
+    
+    # Final verdict
+    is_valid = (
+        comparison_results['csv_row_count'] == comparison_results['db_row_count'] and
+        len(comparison_results['missing_in_db']) == 0 and
+        len(comparison_results['extra_in_db']) == 0 and
+        comparison_results['total_mismatches'] == 0
+    )
+    
+    if is_valid:
+        logging.info("\n✅ VALIDATION PASSED: CSV and database match!")
+    else:
+        logging.warning("\n⚠️  VALIDATION FAILED: Differences found between CSV and database")
+    
+    engine.dispose()
+    return is_valid
+
+# ------------------------------------------------------------------------
+# Main Entry Point
+# ------------------------------------------------------------------------
 def main():
-    """Main execution function."""
     parser = argparse.ArgumentParser(
-        description='Push categorized incident CSV to PostgreSQL',
+        description='Validate that database table matches CSV file',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --truncate
-  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --log-file my_log.log
-
-Environment variables (optional):
-  PGHOST=localhost
-  PGPORT=5432
-  PGDATABASE=service_automation_db
-  PGUSER=postgres
-  PGPASSWORD=your_password
-
-Or use .pgpass file for password-less authentication
+  python validate_csv_vs_database.py incidents.csv
+  python validate_csv_vs_database.py incidents.csv --table-name incident_data --output report.txt
+  python validate_csv_vs_database.py incidents.csv --host localhost --port 5432 --database mydb
         """
     )
     
-    parser.add_argument('csv_file', help='Path to categorized incident CSV file')
-    parser.add_argument('--truncate', action='store_true', 
-                       help='Truncate table before inserting (overwrite mode)')
-    parser.add_argument('--table', type=str, default=None,
-                       help='Table name (default: incident_data, will be lowercase)')
-    parser.add_argument('--database', type=str, default=None,
-                       help='Database name (default: from config)')
-    parser.add_argument('--no-create-table', action='store_true',
-                       help='Do not create table if it does not exist (default: auto-create)')
-    parser.add_argument('--log-file', type=str, default=None,
-                       help='Path to log file (default: auto-generated with timestamp)')
+    parser.add_argument('csv_file', help='Path to CSV file to validate')
+    parser.add_argument('--table-name', default='incident_data', 
+                       help='Database table name (default: incident_data)')
+    parser.add_argument('--database', help='Database name (default: from PGDATABASE env var)')
+    parser.add_argument('--user', help='Database user (default: from PGUSER env var)')
+    parser.add_argument('--host', help='Database host (default: from PGHOST env var)')
+    parser.add_argument('--port', help='Database port (default: from PGPORT env var)')
+    parser.add_argument('--password', help='Database password (default: from PGPASSWORD env var)')
+    parser.add_argument('--output', help='Output report file path')
+    parser.add_argument('--log-file', help='Log file path (default: auto-generated)')
     
     args = parser.parse_args()
     
-    # Setup logging (creates log file automatically if not specified)
+    # Setup logging
     log_file = setup_logging(args.log_file)
     
-    # Check if file exists
-    if not os.path.exists(args.csv_file):
-        logging.error(f"✗ CSV file not found: {args.csv_file}")
+    # Run validation
+    try:
+        success = validate_csv_vs_database(
+            csv_file_path=args.csv_file,
+            table_name=args.table_name,
+            database=args.database,
+            user=args.user,
+            host=args.host,
+            port=args.port,
+            password=args.password,
+            output_file=args.output
+        )
+        
+        if success:
+            logging.info(f"\n✅ Validation completed successfully")
+            sys.exit(0)
+        else:
+            logging.warning(f"\n⚠️  Validation found differences. Check log for details.")
+            sys.exit(1)
+            
+    except KeyboardInterrupt:
+        logging.info("\n⚠️  Validation interrupted by user")
         sys.exit(1)
-    
-    # Push to PostgreSQL
-    success = push_incidents_to_postgresql(
-        args.csv_file,
-        table_name=args.table,
-        database=args.database,
-        truncate=args.truncate,
-        create_table=not args.no_create_table,
-        log_file=log_file
-    )
-    
-    if success:
-        logging.info(f"\n📝 Full log saved to: {os.path.abspath(log_file)}")
-        sys.exit(0)
-    else:
-        logging.error(f"\n📝 Error log saved to: {os.path.abspath(log_file)}")
+    except Exception as e:
+        logging.error(f"\n❌ Validation failed with error: {e}")
+        logging.error(traceback.format_exc())
         sys.exit(1)
+    finally:
+        logging.info(f"\n📝 Log file: {os.path.abspath(log_file)}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
