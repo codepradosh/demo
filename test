@@ -602,9 +602,8 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                         elif parsed_count < total_count and initial_non_null > 0:
                             failed_count = total_count - parsed_count
                             date_conversion_stats['partial'] += 1
-                            logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
                             
-                            # Log sample of failed values for debugging (first 5 unique failed values)
+                            # Check if failures are just null/empty values (expected)
                             try:
                                 if original_values is not None:
                                     failed_mask = df[col].isna()
@@ -613,10 +612,22 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                                         failed_original = original_values[failed_mask]
                                         if len(failed_original) > 0:
                                             failed_samples = failed_original.astype(str).dropna().unique()[:5]
-                                            if len(failed_samples) > 0:
-                                                logging.warning(f"      Sample failed values: {list(failed_samples)}")
+                                            # Check if all failures are just null/empty
+                                            all_nulls = all(
+                                                str(s).lower().strip() in ['nan', 'none', 'null', '', 'nat'] 
+                                                for s in failed_samples
+                                            )
+                                            if all_nulls and len(failed_samples) <= 1:
+                                                # These are just null values, which is expected
+                                                logging.info(f"   ✓ {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} were null/empty - expected)")
+                                            else:
+                                                # Actual parsing failures
+                                                logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
+                                                if len(failed_samples) > 0:
+                                                    logging.warning(f"      Sample failed values: {list(failed_samples)}")
                             except Exception as sample_error:
-                                logging.debug(f"      Could not get failed samples: {sample_error}")
+                                logging.debug(f"      Could not analyze failed samples: {sample_error}")
+                                logging.warning(f"   ⚠️  {col}: {parsed_count:,}/{total_count:,} values parsed successfully ({failed_count:,} failed)")
                         elif parsed_count > 0:
                             date_conversion_stats['success'] += 1
                             logging.info(f"   ✓ Converted {col} to datetime ({parsed_count:,} values)")
@@ -649,9 +660,9 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                     f"{date_conversion_stats['skipped']} skipped")
         
         # Convert boolean columns (handle BIT fields)
-        # Note: made_sla may contain string values like "Response - 8 hrs", so handle carefully
+        # Note: made_sla and knowledge are VARCHAR in the database, so only convert 'active'
         logging.info(f"\n⏳ Converting boolean columns...")
-        bool_columns = ['active', 'made_sla', 'knowledge']
+        bool_columns = ['active']  # made_sla and knowledge are VARCHAR, not boolean
         for col in bool_columns:
             if col in df.columns:
                 try:
@@ -667,28 +678,14 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off', '']
                             bool_like = all(v.strip() in bool_like_values for v in unique_vals)
                             
-                            # Special handling for made_sla - check if it contains SLA response strings
-                            if col == 'made_sla':
-                                # Check for SLA response patterns (e.g., "Response - 8 hrs", "Resolution - 16 hrs")
-                                has_sla_strings = any(
-                                    'response' in v or 'resolution' in v or 'hrs' in v or 'hours' in v 
-                                    for v in unique_vals
-                                )
-                                if has_sla_strings:
-                                    # Keep as string - contains SLA response information, not just boolean
-                                    logging.warning(f"   ⚠️  {col} kept as string (contains SLA response strings: {list(unique_vals[:5])})")
-                                    logging.warning(f"      This column should be VARCHAR in the database, not BOOLEAN/BIT")
-                                    continue  # Skip boolean conversion
-                            
                             if bool_like and len(unique_vals) <= 4:
                                 # Convert to boolean
                                 df[col] = df[col].astype(str).str.lower().str.strip().isin(['true', '1', 'yes', 'y', 't', 'on'])
                                 final_non_null = df[col].notna().sum()
                                 logging.info(f"   ✓ Converted {col} to boolean (non-null: {initial_non_null} -> {final_non_null}, unique values: {list(unique_vals)})")
                             else:
-                                # Keep as string but log
-                                logging.warning(f"   ⚠️  {col} kept as string (not boolean-like: {list(unique_vals[:5])})")
-                                logging.warning(f"      This column should be VARCHAR in the database, not BOOLEAN/BIT")
+                                # Not boolean-like, keep as is (shouldn't happen for 'active', but handle gracefully)
+                                logging.warning(f"   ⚠️  {col} contains non-boolean values: {list(unique_vals[:5])}, keeping as string")
                         else:
                             # All null, set to boolean with all False
                             df[col] = False
