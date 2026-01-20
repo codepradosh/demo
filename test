@@ -1,597 +1,192 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Complete Incident Data Pipeline
-Flow:
-1. Pull data from Atlas and gsnow (2024 to current)
-2. Merge them properly (Atlas PRIMARY, gsnow supplementary)
-3. Fix opened_at issue (use created_on as fallback for gsnow)
-4. Export to CSV
-5. Run categorization script (category_latest.py) with GPT clustering
-6. Load categorized data to PostgreSQL
+Push categorized incident CSV file to PostgreSQL table Incident_Data
+Usage: python push_incidents_to_postgres.py <csv_file_path> [--truncate]
 """
 
 import os
 import sys
-import json
 import pandas as pd
-import numpy as np
-import urllib3
-import datetime
 import traceback
-import re
-import subprocess
-import tempfile
-from pathlib import Path
-from dotenv import load_dotenv
-from pystarburst import Session
-from trino.auth import OAuth2Authentication
-from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
+import logging
+from datetime import datetime
+import argparse
 from urllib.parse import quote_plus
-from tqdm import tqdm
 
-# Disable SSL warnings
-urllib3.disable_warnings()
+# Progress bar
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    # Fallback: create a dummy tqdm that does nothing
+    class tqdm:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def update(self, n):
+            pass
+        def set_postfix(self, *args, **kwargs):
+            pass
 
-# PostgreSQL imports
+# PostgreSQL client
 try:
     import psycopg2
+    from sqlalchemy import create_engine, text, inspect
+    from sqlalchemy.types import Integer, BigInteger, Float, Boolean, DateTime, Text, String, Date
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
-    print("Warning: PostgreSQL libraries not available. Install with: pip install psycopg2-binary sqlalchemy")
+    print("ERROR: PostgreSQL libraries not available.")
+    print("Please install: pip install psycopg2-binary sqlalchemy pandas")
+    sys.exit(1)
 
 # ------------------------------------------------------------------------
-# Configuration
+# Logging Configuration
 # ------------------------------------------------------------------------
-# Atlas connection details
-ATLAS_CONNECTION_DETAILS = [
-    {
-        "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType={LDAP Authentication};SSL=1",
-        "catalogName": "ipm_service_management",
-        "schemaName": "ipm_service_management_schema",
-        "tableName": "ipm_incident_flat",
-        "dataproductId": "281244d9-2e0f-4c77-ba20-964da41911b1",
-        "outputportId": "df9f6069-8ea1-4f0d-b01a-76e5ba693ca6"
-    }
-]
+def setup_logging():
+    """Set up logging configuration."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
-# gsnow connection details
-GSNOW_CONNECTION_DETAILS = [
-    {
-        "connectionString": "Driver={Starburst ODBC Driver};Host=app-neu.starburst-prod.azpriv-cloud.ubs.net;Port=443;AuthenticationType=LDAP Authentication;SSL=1",
-        "catalogName": "ts_dwh_gsnow",
-        "schemaName": "ts_dwh_gsnow_schema",
-        "tableName": "gsnow_inc_main_unstrreq_36mth",
-        "dataproductId": "72567983-5ac4-405b-a6f8-6b9bd79244fe",
-        "outputportId": "1709c349-7dae-492f-934e-2ce4bb5c5870"
-    }
-]
-
+# ------------------------------------------------------------------------
 # PostgreSQL Configuration
+# ------------------------------------------------------------------------
 POSTGRES_CONFIG = {
     'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
     'port': os.getenv('PGPORT', '5432'),
     'database': os.getenv('PGDATABASE', 'service_automation_db'),
     'user': os.getenv('PGUSER', 'powerbi_user'),
     'password': os.getenv('PGPASSWORD', 'Report@123'),
-    'table_name': 'Incident_Data'  # Capitalized table name
+    'table_name': 'incident_data'  # Changed to lowercase incident_data
 }
 
-# Azure OpenAI Configuration (for categorization)
-AZURE_ENDPOINT = "https://dh-automation-1.openai.azure.com/openai/v1"
-AZURE_API_VERSION = "2024-02-15-preview"
-GPT_MODEL = "gpt-4o-mini"
-AZURE_API_KEY = os.getenv('AZURE_OPENAI_API_KEY', '')
-
 # ------------------------------------------------------------------------
-# Database Connection Functions
-# ------------------------------------------------------------------------
-def create_atlas_session():
-    """Create PyStarburst session for IPM Service Management catalog (Atlas)"""
-    connection_details = ATLAS_CONNECTION_DETAILS
-    
-    session = None
-    catalog_name = None
-    
-    for platform_connection_info in connection_details:
-        if platform_connection_info.get("catalogName") == "ipm_service_management":
-            connection_string_list = platform_connection_info["connectionString"].split(";")
-            catalog_name = platform_connection_info["catalogName"]
-            
-            starburst_connection_details = {}
-            for elem in connection_string_list:
-                if "=" in elem:
-                    key, value = elem.split("=", 1)
-                    starburst_connection_details[key.strip()] = value.strip()
-            
-            host = starburst_connection_details.get("Host")
-            port = starburst_connection_details.get("Port", "443")
-            
-            db_parameters = {
-                "host": host,
-                "port": port,
-                "http_scheme": "https",
-                "verify": False,
-                "auth": OAuth2Authentication(),
-                "catalog": catalog_name
-            }
-            session = Session.builder.configs(db_parameters).create()
-            break
-    
-    return session, catalog_name
-
-def create_gsnow_session():
-    """Create PyStarburst session for ts_dwh_gsnow catalog"""
-    connection_details = GSNOW_CONNECTION_DETAILS
-    
-    session = None
-    catalog_name = None
-    
-    for platform_connection_info in connection_details:
-        if platform_connection_info.get("catalogName") == "ts_dwh_gsnow":
-            connection_string_list = platform_connection_info["connectionString"].split(";")
-            catalog_name = platform_connection_info["catalogName"]
-            
-            starburst_connection_details = {}
-            for elem in connection_string_list:
-                if "=" in elem:
-                    key, value = elem.split("=", 1)
-                    starburst_connection_details[key.strip()] = value.strip()
-            
-            host = starburst_connection_details.get("Host")
-            port = starburst_connection_details.get("Port", "443")
-            
-            db_parameters = {
-                "host": host,
-                "port": port,
-                "http_scheme": "https",
-                "verify": False,
-                "auth": OAuth2Authentication(),
-                "catalog": catalog_name
-            }
-            session = Session.builder.configs(db_parameters).create()
-            break
-    
-    return session, catalog_name
-
-# ------------------------------------------------------------------------
-# Column Mapping
-# ------------------------------------------------------------------------
-def get_column_mapping():
-    """Define column mapping between Atlas and gsnow sources"""
-    mapping = {
-        "inc_number": "incident_number",
-        "assigned_grp": "assignment_group",
-        "created_on": "sys_created_on",
-        "opened_at": "opened_at",
-        "resolved_at": "resolved_at",
-        "closed_at": "closed_at",
-        "updated_on": "sys_updated_on",
-        "inc_priority": "priority",
-        "severity": "severity",
-        "urgency": "urgency",
-        "business_impact": "business_impact",
-        "operational_impact": "u_operational_impact",
-        "category": "category",
-        "sub-category": "subcategory",
-        "type": "contact_type",
-        "contact_type": "contact_type",
-        "short_description": "short_description",
-        "description": "description",
-        "solution": "close_notes",
-        "service_owner_grp": "business_service",
-        "service_impacted": "cmdb_ci",
-        "service_impacted_id": "cmdb_ci_sys_id",
-        "creator_gpn": "opened_by_gpn",
-        "creator_bus_name": "opened_by_user_name",
-        "impacted_country": "u_impacted_country",
-        "business_cluster": "u_business_cluster",
-        "business_cluster_owner": "u_business_cluster_owner",
-        "business_cluster_owner_gpn": "u_business_cluster_owner_gpn",
-        "service_environment": "u_service_environment",
-        "service_division": "service_division",
-        "service_division_id": "service_division_id",
-        "business_stream": "u_business_stream",
-        "business_stream_prg_mgr": "u_business_stream_prg_mgr",
-        "business_stream_prg_mgr_gpn": "u_business_stream_prg_mgr_gpn",
-        "business_stream_id": "u_business_stream_id",
-        "it_sector": "u_it_sector",
-        "it_sector_cio": "u_it_sector_cio",
-        "solution_domain": "u_solution_domain",
-        "solution_domain_id": "u_solution_domain_id",
-        "solution_domain_mgr": "u_solution_domain_mgr",
-        "solution_domain_mgr_gpn": "u_solution_domain_mgr_gpn",
-        "swci": "swci_id",
-        "swci_id": "swci_id",
-        "swc": "swc",
-        "swc_id": "swc_id",
-        "state": "state",
-        "business_impact_severity": "business_impact",
-        "resolution_sla_name": "made_sla",
-        "response_ola_name": "made_sla",
-        "1st_assigned_grp": "assignment_group",
-        "updated_by_gpn": "sys_updated_by",
-        "resolved_by_name": "resolved_by_user_name",
-        "attached_kb_number": "knowledge",
-        "related_item": "parent",
-        "source_name": "origin_table",
-        "service_type": "type",
-        "technology_bcm_tier": "u_technology_bcm_tier",
-        "bcm_criticality_tier_rating": "u_bcm_criticality_tier_rating",
-    }
-    return mapping
-
-# ------------------------------------------------------------------------
-# Data Fetching Functions
-# ------------------------------------------------------------------------
-def fetch_atlas_data(session, start_date="2024-01-01", end_date=None):
-    """Fetch data from Atlas (IPM Incident Flat) for DH assignment groups"""
-    if end_date is None:
-        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    print("\n" + "=" * 80)
-    print("📥 FETCHING ATLAS DATA")
-    print("=" * 80)
-    print(f"📅 Period: {start_date} to {end_date} (end exclusive)")
-    
-    catalog = "ipm_service_management"
-    schema = "ipm_service_management_schema"
-    table = "ipm_incident_flat"
-    fqtn = f"{catalog}.{schema}.{table}"
-    date_col = "opened_at"
-    
-    atlas_columns = [
-        "incident_number", "opened_at", "opened_by_user_name", "opened_by_gpn",
-        "closed_at", "resolved_at", "assignment_group", "assignment_group_id",
-        "assigned_to_gpn", "assigned_to_user_name", "caller_gpn", "caller_user_name",
-        "state", "priority", "severity", "category", "subcategory", "short_description",
-        "description", "impact", "urgency", "business_impact", "business_service",
-        "cmdb_ci", "cmdb_ci_sys_id", "location", "company", "active", "incident_state",
-        "reassignment_count", "reopen_count", "time_worked", "business_duration",
-        "calendar_duration", "made_sla", "u_manager_in_charge_gpn",
-        "u_manager_in_charge_user_name", "u_financial_impact", "u_operational_impact",
-        "u_reputational_impact", "u_regulatory_impact", "u_regulators_informed",
-        "u_impacted_country", "sys_created_on", "sys_updated_on", "sys_updated_by",
-        "resolved_by_user_name", "resolved_by_gpn", "close_notes", "knowledge",
-        "parent", "origin_table", "contact_type",
-    ]
-    
-    normalized_expr = f"regexp_replace({date_col}, '(.*)([+-]\\\\d{{2}})(\\\\d{{2}})$', '\\\\1\\\\2:\\\\3')"
-    parse_iso = f"from_iso8601_timestamp({normalized_expr})"
-    
-    col_list_sql = ", ".join([f'"{c}"' for c in atlas_columns])
-    
-    query = f"""
-    SELECT {col_list_sql}
-    FROM {fqtn}
-    WHERE {normalized_expr} IS NOT NULL
-      AND {parse_iso} >= TIMESTAMP '{start_date} 00:00:00'
-      AND {parse_iso} <  TIMESTAMP '{end_date} 00:00:00'
-      AND assignment_group LIKE 'DH-%'
-    ORDER BY {parse_iso} DESC
-    """
-    
-    try:
-        print(f"⏳ Fetching Atlas records...")
-        df_atlas = session.sql(query).to_pandas()
-        df_atlas['data_source'] = 'Atlas'
-        print(f"✅ Retrieved {len(df_atlas):,} Atlas records")
-        return df_atlas
-    except Exception as e:
-        print(f"❌ Error fetching Atlas data: {e}")
-        traceback.print_exc()
-        return None
-
-def fetch_gsnow_data(session, start_date="2024-01-01", end_date=None):
-    """Fetch data from gsnow for DH assignment groups"""
-    if end_date is None:
-        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    print("\n" + "=" * 80)
-    print("📥 FETCHING GSNOW DATA")
-    print("=" * 80)
-    print(f"📅 Period: {start_date} to {end_date} (end exclusive)")
-    
-    schema = "ts_dwh_gsnow_schema"
-    table = "gsnow_inc_main_unstrreq_36mth"
-    table_ref = f"{schema}.{table}"
-    date_col = "opened_at"
-    
-    gsnow_columns = [
-        "inc_number", "assigned_grp", "business_impact", "category", "closed_at",
-        "contact_type", "created_on", "opened_at", "operational_impact", "inc_priority",
-        "resolution_sla_name", "resolved_at", "response_ola_name", "service_impacted",
-        "service_impacted_id", "service_owner_grp", "severity", "short_description",
-        "state", "type", "updated_on", "urgency", "creator_bus_name", "creator_gpn",
-        "service_environment", "impacted_country", "description", "sub-category",
-        "ola_created_by_bus_name", "ola_created_by_gpn", "1st_assigned_grp",
-        "updated_by_gpn", "business_impact_severity", "swci", "swci_id", "swc",
-        "swc_id", "bcm_criticality_tier_rating", "solution", "solution_id",
-        "solution_domain_mgr", "solution_domain_mgr_gpn", "solution_domain",
-        "solution_domain_id", "business_cluster_owner", "business_cluster_owner_gpn",
-        "business_cluster", "business_cluster_id", "it_sector_cio", "it_sector",
-        "business_stream_prg_mgr", "business_stream_prg_mgr_gpn", "business_stream",
-        "business_stream_id", "service_division_id", "service_division",
-        "attached_kb_number", "related_item", "source_name", "incremental_field",
-        "ext_name", "service_type", "technology_bcm_tier", "resolved_by_name",
-    ]
-    
-    col_list_sql = ", ".join([f'"{c}"' for c in gsnow_columns])
-    
-    query = f"""
-    SELECT {col_list_sql}
-    FROM {table_ref}
-    WHERE {date_col} >= DATE '{start_date}'
-      AND {date_col} <  DATE '{end_date}'
-      AND assigned_grp LIKE 'DH-%'
-    ORDER BY {date_col} DESC
-    """
-    
-    try:
-        print(f"⏳ Fetching gsnow records...")
-        df_gsnow = session.sql(query).to_pandas()
-        df_gsnow['data_source'] = 'gsnow'
-        print(f"✅ Retrieved {len(df_gsnow):,} gsnow records")
-        return df_gsnow
-    except Exception as e:
-        print(f"❌ Error fetching gsnow data: {e}")
-        traceback.print_exc()
-        return None
-
-# ------------------------------------------------------------------------
-# Data Merging and Fixing Functions
-# ------------------------------------------------------------------------
-def map_and_combine(df_atlas, df_gsnow):
-    """Map gsnow columns to Atlas columns and combine datasets"""
-    print("\n" + "=" * 80)
-    print("🔄 MAPPING COLUMNS AND COMBINING DATASETS")
-    print("=" * 80)
-    
-    if df_atlas is None and df_gsnow is None:
-        print("❌ No data from either source")
-        return None
-    
-    if df_atlas is None:
-        print("⚠️ Warning: No Atlas data available")
-        return None
-    
-    column_mapping = get_column_mapping()
-    atlas_columns = list(df_atlas.columns)
-    standard_columns = atlas_columns.copy()
-    
-    print(f"📋 Atlas (PRIMARY) columns: {len(standard_columns)}")
-    print(f"✅ Atlas data: {len(df_atlas):,} records")
-    
-    # Process gsnow data - map to Atlas structure
-    if df_gsnow is not None:
-        print(f"✅ gsnow data: {len(df_gsnow):,} records")
-        print("🔄 Mapping gsnow columns to Atlas structure...")
-        
-        df_gsnow_mapped = pd.DataFrame()
-        reverse_mapping = {v: k for k, v in column_mapping.items() if v is not None}
-        
-        for atlas_col in standard_columns:
-            if atlas_col == 'data_source':
-                df_gsnow_mapped[atlas_col] = df_gsnow.get('data_source', 'gsnow')
-            elif atlas_col in reverse_mapping:
-                gsnow_col = reverse_mapping[atlas_col]
-                if gsnow_col in df_gsnow.columns:
-                    df_gsnow_mapped[atlas_col] = df_gsnow[gsnow_col]
-                else:
-                    df_gsnow_mapped[atlas_col] = None
-            else:
-                df_gsnow_mapped[atlas_col] = None
-        
-        df_gsnow = df_gsnow_mapped
-        print(f"✅ gsnow columns mapped to Atlas structure")
-    
-    # Combine datasets
-    print(f"\n🔀 Combining datasets...")
-    dataframes = []
-    
-    if df_atlas is not None:
-        dataframes.append(df_atlas[standard_columns])
-        print(f"   📊 Added {len(df_atlas):,} Atlas records (PRIMARY)")
-    
-    if df_gsnow is not None and len(df_gsnow) > 0:
-        dataframes.append(df_gsnow[standard_columns])
-        print(f"   📊 Added {len(df_gsnow):,} gsnow records (supplementary)")
-    
-    if not dataframes:
-        print("❌ No dataframes to combine")
-        return None
-    
-    df_combined = pd.concat(dataframes, ignore_index=True)
-    print(f"✅ Combined dataset: {len(df_combined):,} total records")
-    
-    # Handle duplicates - prioritize Atlas
-    if 'incident_number' in df_combined.columns:
-        initial_count = len(df_combined)
-        df_combined['_priority'] = df_combined['data_source'].map({'Atlas': 1, 'gsnow': 2})
-        df_combined = df_combined.sort_values('_priority').drop_duplicates(
-            subset=['incident_number'], 
-            keep='first'
-        )
-        df_combined = df_combined.drop(columns=['_priority'])
-        removed = initial_count - len(df_combined)
-        if removed > 0:
-            print(f"🔍 Removed {removed:,} duplicate incident_numbers (kept Atlas records)")
-    
-    return df_combined
-
-def fix_opened_at_for_gsnow(df_combined):
-    """Fix NULL opened_at for gsnow records using sys_created_on as fallback"""
-    print("\n" + "=" * 80)
-    print("🔧 FIXING opened_at FOR GSNOW RECORDS")
-    print("=" * 80)
-    
-    if df_combined is None or len(df_combined) == 0:
-        return df_combined
-    
-    if 'opened_at' not in df_combined.columns or 'sys_created_on' not in df_combined.columns:
-        print("⚠️  Missing required columns (opened_at or sys_created_on)")
-        return df_combined
-    
-    # Find gsnow records with NULL opened_at
-    gsnow_mask = (df_combined['data_source'] == 'gsnow') & (df_combined['opened_at'].isna())
-    null_count = gsnow_mask.sum()
-    
-    if null_count > 0:
-        print(f"⚠️  Found {null_count:,} gsnow records with NULL opened_at")
-        print("   Using sys_created_on (from created_on) as fallback...")
-        
-        # Use sys_created_on as fallback for opened_at
-        df_combined.loc[gsnow_mask, 'opened_at'] = df_combined.loc[gsnow_mask, 'sys_created_on']
-        
-        # Count how many were successfully filled
-        filled_count = ((df_combined['data_source'] == 'gsnow') & 
-                       (df_combined['opened_at'].notna()) & 
-                       gsnow_mask).sum()
-        
-        print(f"✅ Filled {filled_count:,} NULL opened_at values with sys_created_on")
-        
-        # Count remaining NULLs
-        remaining_nulls = ((df_combined['data_source'] == 'gsnow') & 
-                          (df_combined['opened_at'].isna())).sum()
-        if remaining_nulls > 0:
-            print(f"⚠️  {remaining_nulls:,} gsnow records still have NULL opened_at (sys_created_on also NULL)")
-    else:
-        print("✅ No gsnow records with NULL opened_at found")
-    
-    return df_combined
-
-# ------------------------------------------------------------------------
-# Categorization Function
-# ------------------------------------------------------------------------
-def categorize_with_category_latest(input_csv, output_csv=None):
-    """Run category_latest.py to categorize the data"""
-    print("\n" + "=" * 80)
-    print("🔍 RUNNING CATEGORIZATION (category_latest.py)")
-    print("=" * 80)
-    
-    # Find category_latest.py script
-    script_dir = Path(__file__).parent.resolve()
-    category_script = None
-    
-    for folder_name in ["Categorise", "categorization", "Categorization"]:
-        potential_path = script_dir / folder_name / "category_latest.py"
-        if potential_path.exists():
-            category_script = potential_path
-            print(f"✅ Found category_latest.py at: {category_script}")
-            break
-    
-    if not category_script:
-        print(f"❌ category_latest.py not found")
-        return None
-    
-    # Use provided output or create temp file
-    if output_csv is None:
-        output_csv = input_csv.replace('.csv', '_categorized.csv')
-    
-    # Build command
-    cmd = [
-        sys.executable,
-        str(category_script),
-        '-i', input_csv,
-        '-o', output_csv,
-        '--use-gpt',
-        '--cluster-categories',
-        '--cluster-method', 'gpt',
-        '--skip-drain3',
-        '--max-workers', '50',
-    ]
-    
-    print(f"🚀 Calling category_latest.py...")
-    print(f"   Input: {input_csv}")
-    print(f"   Output: {output_csv}")
-    
-    try:
-        start_time = datetime.datetime.now()
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8'
-        )
-        elapsed_time = (datetime.datetime.now() - start_time).total_seconds()
-        
-        if result.returncode != 0:
-            print(f"❌ category_latest.py failed with return code {result.returncode}")
-            if result.stderr:
-                print("STDERR:")
-                print(result.stderr[-2000:])  # Last 2000 chars
-            if result.stdout:
-                print("STDOUT (last 2000 chars):")
-                print(result.stdout[-2000:])
-            return None
-        
-        print(f"✅ category_latest.py completed in {elapsed_time:.1f}s")
-        
-        # Load categorized CSV
-        if os.path.exists(output_csv):
-            print(f"📥 Loading categorized data from: {output_csv}")
-            df_categorized = pd.read_csv(output_csv, encoding='utf-8', low_memory=False)
-            print(f"✅ Loaded categorized data: {len(df_categorized):,} rows")
-            return df_categorized
-        else:
-            print(f"❌ Output file not found: {output_csv}")
-            return None
-            
-    except Exception as e:
-        print(f"❌ Error during categorization: {e}")
-        traceback.print_exc()
-        return None
-
-# ------------------------------------------------------------------------
-# PostgreSQL Functions
+# Data Type Inference
 # ------------------------------------------------------------------------
 def infer_postgres_type(series, col_name):
-    """Infer PostgreSQL data type from pandas Series"""
+    """
+    Infer PostgreSQL data type from pandas Series.
+    
+    Parameters
+    ----------
+    series : pd.Series
+        The pandas Series to analyze
+    col_name : str
+        Column name (for special handling)
+    
+    Returns
+    -------
+    sqlalchemy.types.TypeEngine
+        SQLAlchemy type for PostgreSQL
+    """
+    # Remove null values for type inference
     non_null = series.dropna()
     
     if len(non_null) == 0:
+        # All nulls - default to Text
         return Text
     
+    # Check for boolean
     if series.dtype == 'bool' or non_null.dtype == 'bool':
         return Boolean
     
+    # Check for datetime
     if pd.api.types.is_datetime64_any_dtype(series):
         return DateTime
     
+    # Check for date
+    if pd.api.types.is_datetime64_any_dtype(series) and 'date' in col_name.lower():
+        # Try to parse as date if it's a date column
+        try:
+            pd.to_datetime(non_null.iloc[0])
+            return Date
+        except:
+            pass
+    
+    # Check for integer
     if pd.api.types.is_integer_dtype(series):
-        if non_null.abs().max() < 2147483647:
+        # Check if values fit in regular integer or need bigint
+        if non_null.abs().max() < 2147483647:  # PostgreSQL INTEGER max
             return Integer
         else:
             return BigInteger
     
+    # Check for float
     if pd.api.types.is_float_dtype(series):
         return Float
     
+    # Check if numeric string can be converted to int
+    if series.dtype == 'object':
+        # Try to convert to numeric
+        try:
+            numeric_series = pd.to_numeric(non_null, errors='coerce')
+            if numeric_series.notna().sum() == len(non_null):
+                # All values are numeric
+                if numeric_series.abs().max() < 2147483647:
+                    return Integer
+                else:
+                    return BigInteger
+        except:
+            pass
+    
+    # Check string length for VARCHAR vs TEXT
     if series.dtype == 'object':
         max_length = non_null.astype(str).str.len().max()
         if max_length > 0 and max_length < 255:
-            return String(max_length + 50)
+            # Use VARCHAR with some buffer
+            return String(max_length + 50)  # Add 50 char buffer
         else:
             return Text
     
+    # Default to Text
     return Text
 
 def create_table_from_dataframe(engine, df, table_name, schema='public'):
-    """Create PostgreSQL table from DataFrame with inferred data types"""
+    """
+    Create PostgreSQL table from DataFrame with inferred data types.
+    
+    Parameters
+    ----------
+    engine : sqlalchemy.engine.Engine
+        SQLAlchemy engine
+    df : pd.DataFrame
+        DataFrame to create table from
+    table_name : str
+        Table name (will be created in lowercase)
+    schema : str
+        Schema name (default: 'public')
+    
+    Returns
+    -------
+    bool
+        True if successful, False otherwise
+    """
     try:
-        print(f"\n📋 CREATING TABLE: {table_name}")
+        logging.info(f"\n{'='*80}")
+        logging.info(f"📋 CREATING TABLE: {table_name}")
+        logging.info(f"{'='*80}")
         
+        # Infer column types
         column_types = {}
         for col in df.columns:
             pg_type = infer_postgres_type(df[col], col)
             column_types[col] = pg_type
+            logging.info(f"   {col}: {pg_type}")
         
+        # Build CREATE TABLE SQL
         columns_sql = []
         for col in df.columns:
             pg_type = column_types[col]
             
+            # Convert SQLAlchemy type to PostgreSQL type string
             if pg_type == Boolean:
                 type_str = "BOOLEAN"
             elif pg_type == Integer:
@@ -609,10 +204,11 @@ def create_table_from_dataframe(engine, df, table_name, schema='public'):
             else:
                 type_str = "TEXT"
             
+            # Escape column name if needed
             col_escaped = f'"{col}"'
             columns_sql.append(f"{col_escaped} {type_str}")
         
-        # Add created_at and updated_at
+        # Add created_at and updated_at timestamps
         columns_sql.append('"created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
         columns_sql.append('"updated_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
         
@@ -622,328 +218,432 @@ def create_table_from_dataframe(engine, df, table_name, schema='public'):
         );
         """
         
+        logging.info(f"\n⏳ Creating table '{table_name}'...")
         with engine.connect() as conn:
             conn.execute(text(create_table_sql))
             conn.commit()
         
-        print(f"✅ Table '{table_name}' created successfully")
+        logging.info(f"✅ Table '{table_name}' created successfully")
+        logging.info(f"   Columns: {len(df.columns) + 2} (including created_at, updated_at)")
+        
         return True
         
     except Exception as e:
-        print(f"❌ Error creating table: {e}")
-        traceback.print_exc()
+        logging.error(f"❌ Error creating table: {e}")
+        logging.error(traceback.format_exc())
         return False
 
-def load_to_postgresql(df, table_name='incident_data', database='service_automation_db', truncate=True):
-    """Load DataFrame to PostgreSQL table"""
+# ------------------------------------------------------------------------
+# Main Function
+# ------------------------------------------------------------------------
+def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None, 
+                                 user=None, host=None, port=None, password=None,
+                                 truncate=False, create_table=True):
+    """
+    Push categorized incident CSV file to PostgreSQL table.
+    
+    Parameters
+    ----------
+    csv_file_path : str
+        Path to the categorized CSV file to import
+    table_name : str, optional
+        Target table name (default: 'Incident_Data')
+    database : str, optional
+        Database name (default: from config or 'service_automation_db')
+    user : str, optional
+        PostgreSQL username (default: from config)
+    host : str, optional
+        PostgreSQL host (default: from config)
+    port : str, optional
+        PostgreSQL port (default: from config or '5432')
+    password : str, optional
+        PostgreSQL password (default: from environment variable PGPASSWORD)
+    truncate : bool, optional
+        If True, truncate table before inserting (default: False)
+        
+    Returns
+    -------
+    bool
+        True if successful, False otherwise
+    """
     if not POSTGRES_AVAILABLE:
-        print("❌ PostgreSQL libraries not available")
+        logging.error("✗ PostgreSQL libraries not available. Cannot export to PostgreSQL.")
         return False
     
-    if df is None or len(df) == 0:
-        print("❌ No data to load")
+    if not os.path.exists(csv_file_path):
+        logging.error(f"✗ CSV file not found: {csv_file_path}")
         return False
     
-    print("\n" + "=" * 80)
-    print("💾 LOADING DATA TO POSTGRESQL")
-    print("=" * 80)
-    
-    pg_host = POSTGRES_CONFIG['host']
-    pg_port = POSTGRES_CONFIG['port']
-    pg_db = database or POSTGRES_CONFIG['database']
-    pg_user = POSTGRES_CONFIG['user']
-    pg_password = POSTGRES_CONFIG['password']
+    # Use provided values or fall back to config/environment
+    table_name = (table_name or POSTGRES_CONFIG['table_name']).lower()  # Ensure lowercase
+    database = database or POSTGRES_CONFIG['database']
+    user = user or POSTGRES_CONFIG['user']
+    host = host or POSTGRES_CONFIG['host']
+    port = port or POSTGRES_CONFIG['port']
+    password = password or POSTGRES_CONFIG['password']
     
     try:
-        encoded_password = quote_plus(pg_password)
-        connection_string = f"postgresql://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_db}"
+        logging.info("="*80)
+        logging.info("📤 Pushing Incident CSV to PostgreSQL")
+        logging.info("="*80)
+        logging.info(f"   CSV file: {csv_file_path}")
+        logging.info(f"   Database: {database}")
+        logging.info(f"   Table: {table_name}")
+        logging.info(f"   Host: {host}:{port}")
+        logging.info(f"   User: {user}")
+        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
+        logging.info(f"   Create table: {create_table}")
+        logging.info("="*80)
         
-        print(f"📊 Database: {pg_db}")
-        print(f"📋 Table: {table_name}")
-        print(f"📈 Rows to insert: {len(df):,}")
+        # Read CSV file
+        logging.info(f"\n⏳ Reading CSV file...")
+        try:
+            df = pd.read_csv(csv_file_path, encoding='utf-8', low_memory=False)
+        except UnicodeDecodeError:
+            try:
+                df = pd.read_csv(csv_file_path, encoding='latin-1', low_memory=False)
+            except:
+                df = pd.read_csv(csv_file_path, encoding='cp1252', low_memory=False)
         
+        logging.info(f"✓ Read {len(df):,} rows from CSV")
+        logging.info(f"✓ Columns: {len(df.columns)} ({', '.join(df.columns[:5])}...)")
+        
+        # Convert date columns to datetime if they're strings
+        date_columns = ['opened_at', 'closed_at', 'resolved_at', 'sys_created_on', 'sys_updated_on', 
+                        'created_on', 'updated_on', 'opened_date', 'closed_date']
+        for col in df.columns:
+            if any(date_keyword in col.lower() for date_keyword in ['date', 'time', 'created', 'updated', 'opened', 'closed', 'resolved']):
+                if df[col].dtype == 'object':
+                    try:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                        logging.info(f"✓ Converted {col} to datetime")
+                    except:
+                        pass
+        
+        # Convert boolean columns (handle BIT fields)
+        bool_columns = ['active', 'made_sla', 'knowledge']
+        for col in bool_columns:
+            if col in df.columns:
+                # Handle various boolean representations
+                if df[col].dtype == 'object':
+                    # Convert string representations to boolean
+                    df[col] = df[col].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 't', 'on'])
+                else:
+                    df[col] = df[col].astype(bool)
+        
+        # Convert integer columns
+        int_columns = ['reassignment_count', 'reopen_count']
+        for col in int_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('Int64')
+        
+        # Keep duration fields as VARCHAR (don't convert to numeric)
+        # These should remain as strings per schema: time_worked, business_duration, calendar_duration
+        duration_columns = ['time_worked', 'business_duration', 'calendar_duration']
+        for col in duration_columns:
+            if col in df.columns:
+                df[col] = df[col].astype(str).replace('nan', None)
+        
+        # Create connection string with URL-encoded password
+        # Fix: Use quote_plus to properly encode password (handles @, #, etc.)
+        if password:
+            # URL-encode the password to handle special characters like @
+            encoded_password = quote_plus(password)
+            connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
+        else:
+            # Try without password (trust authentication or .pgpass)
+            connection_string = f"postgresql://{user}@{host}:{port}/{database}"
+        
+        # Create SQLAlchemy engine
+        logging.info(f"\n⏳ Connecting to PostgreSQL...")
         engine = create_engine(connection_string, pool_pre_ping=True)
         
+        # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        print("✅ Connected to PostgreSQL")
+        logging.info(f"✓ Connected to PostgreSQL successfully")
         
-        # Check if table exists (case-sensitive check)
-        with engine.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = '{table_name}'
-                );
-            """))
-            table_exists = result.fetchone()[0]
+        # Check if table exists
+        logging.info(f"\n⏳ Checking if table '{table_name}' exists...")
+        inspector = inspect(engine)
+        table_exists = inspector.has_table(table_name, schema='public')
         
         if not table_exists:
-            print(f"⚠️  Table '{table_name}' does not exist. Creating it...")
-            success = create_table_from_dataframe(engine, df, table_name)
-            if not success:
+            if create_table:
+                logging.info(f"⚠️  Table '{table_name}' does not exist. Creating it...")
+                success = create_table_from_dataframe(engine, df, table_name)
+                if not success:
+                    logging.error(f"✗ Failed to create table '{table_name}'")
+                    engine.dispose()
+                    return False
+            else:
+                logging.error(f"✗ Table '{table_name}' does not exist in database '{database}'")
+                logging.error(f"  Use --create-table to create it automatically")
                 engine.dispose()
                 return False
         else:
-            print(f"✅ Table '{table_name}' exists")
+            logging.info(f"✓ Table '{table_name}' exists")
         
-        # Truncate table FIRST (clean the table)
-        if truncate:
-            print(f"\n🧹 CLEANING TABLE: Truncating '{table_name}'...")
-            with engine.connect() as conn:
-                conn.execute(text(f'TRUNCATE TABLE "{table_name}" CASCADE;'))
-                conn.commit()
-            print(f"✅ Table '{table_name}' cleaned (truncated)")
-        
-        # Get table columns after truncate
-        inspector = inspect(engine)
+        # Get table column names
+        logging.info(f"\n⏳ Fetching table column names...")
         table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
         
-        # Prepare DataFrame - match column names
-        df_to_insert = df.copy()
+        col_count = len(table_columns)
+        logging.info(f"✓ Table has {col_count} columns")
+        
+        # Validate CSV columns match table columns
+        logging.info(f"\n⏳ Validating column names...")
+        
+        csv_columns = [col for col in df.columns]
         table_columns_lower = {col.lower(): col for col in table_columns}
         
+        # Create column mapping (case-insensitive match)
         column_mapping = {}
-        for df_col in df_to_insert.columns:
-            df_col_lower = df_col.lower()
-            if df_col_lower in table_columns_lower:
-                table_col = table_columns_lower[df_col_lower]
-                if df_col != table_col:
-                    column_mapping[df_col] = table_col
+        for csv_col in csv_columns:
+            csv_col_lower = csv_col.lower()
+            if csv_col_lower in table_columns_lower:
+                table_col = table_columns_lower[csv_col_lower]
+                if csv_col != table_col:
+                    column_mapping[csv_col] = table_col
         
         if column_mapping:
-            df_to_insert.rename(columns=column_mapping, inplace=True)
+            df.rename(columns=column_mapping, inplace=True)
+            logging.info(f"✓ Renamed {len(column_mapping)} columns to match table case")
         
-        # Filter to only table columns (excluding metadata)
+        # Find missing columns in CSV
         metadata_cols = {'created_at', 'updated_at'}
+        missing_in_csv = []
+        for table_col in table_columns:
+            if table_col.lower() not in [c.lower() for c in df.columns] and table_col not in metadata_cols:
+                missing_in_csv.append(table_col)
+                df[table_col] = None
+        
+        if missing_in_csv:
+            logging.warning(f"\n⚠️  CSV is missing {len(missing_in_csv)} table columns (set to NULL):")
+            for col in missing_in_csv[:10]:
+                logging.warning(f"   - {col}")
+            if len(missing_in_csv) > 10:
+                logging.warning(f"   ... and {len(missing_in_csv) - 10} more")
+        
+        # Find extra columns in CSV (not in table)
+        extra_in_csv = []
+        for csv_col in df.columns:
+            if csv_col not in table_columns and csv_col not in metadata_cols:
+                extra_in_csv.append(csv_col)
+        
+        if extra_in_csv:
+            logging.warning(f"\n⚠️  CSV has {len(extra_in_csv)} extra columns (will be ignored):")
+            for col in extra_in_csv[:10]:
+                logging.warning(f"   - {col}")
+            if len(extra_in_csv) > 10:
+                logging.warning(f"   ... and {len(extra_in_csv) - 10} more")
+        
+        # Filter DataFrame to only include columns that exist in table
         columns_to_insert = [col for col in table_columns if col not in metadata_cols]
-        df_to_insert = df_to_insert[[col for col in columns_to_insert if col in df_to_insert.columns]].copy()
+        df_final = df[[col for col in columns_to_insert if col in df.columns]].copy()
         
-        # Insert data with progress bar
-        print(f"\n⏳ Inserting {len(df_to_insert):,} rows...")
-        total_rows = len(df_to_insert)
+        # Validate and truncate VARCHAR columns to match table constraints
+        logging.info(f"\n⏳ Validating data against table constraints...")
+        with engine.connect() as conn:
+            # Get column information including max lengths
+            result = conn.execute(text(f"""
+                SELECT 
+                    column_name,
+                    data_type,
+                    character_maximum_length
+                FROM information_schema.columns
+                WHERE table_name = '{table_name}'
+                AND table_schema = 'public'
+                AND character_maximum_length IS NOT NULL
+            """))
+            varchar_columns = {row[0]: row[2] for row in result.fetchall()}
+        
+        # Truncate values that exceed VARCHAR length
+        truncated_count = 0
+        for col_name, max_length in varchar_columns.items():
+            if col_name in df_final.columns:
+                # Check for values exceeding length
+                mask = df_final[col_name].notna()
+                if mask.any():
+                    str_series = df_final.loc[mask, col_name].astype(str)
+                    exceeds_mask = str_series.str.len() > max_length
+                    if exceeds_mask.any():
+                        count = exceeds_mask.sum()
+                        truncated_count += count
+                        df_final.loc[mask & exceeds_mask, col_name] = str_series.loc[exceeds_mask].str[:max_length]
+                        logging.warning(f"   ⚠️  Truncated {count:,} values in '{col_name}' (exceeded VARCHAR({max_length}))")
+        
+        if truncated_count > 0:
+            logging.warning(f"   ⚠️  Total truncated values: {truncated_count:,}")
+        else:
+            logging.info(f"   ✓ All VARCHAR values within constraints")
+        
+        # Check existing row count
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
+            existing_rows = result.fetchone()[0]
+        logging.info(f"✓ Table currently has {existing_rows:,} rows")
+        
+        # Truncate table if requested
+        if truncate:
+            logging.info(f"\n⏳ Truncating table '{table_name}'...")
+            with engine.connect() as conn:
+                conn.execute(text(f'TRUNCATE TABLE "{table_name}";'))
+                conn.commit()
+            logging.info(f"✓ Table truncated")
+        
+        # Push to database with progress bar
+        total_rows = len(df_final)
         chunksize = 1000
+        num_chunks = (total_rows + chunksize - 1) // chunksize
         
-        try:
-            from tqdm import tqdm
-            with tqdm(total=total_rows, desc="Inserting", unit="row", unit_scale=True) as pbar:
+        logging.info(f"\n⏳ Writing {total_rows:,} rows to PostgreSQL table '{table_name}'...")
+        logging.info(f"   Mode: {'TRUNCATE + INSERT' if truncate else 'APPEND'}")
+        logging.info(f"   Columns: {len(df_final.columns)} columns matching table structure")
+        logging.info(f"   Chunk size: {chunksize:,} rows per batch")
+        logging.info(f"   Total batches: {num_chunks:,}")
+        
+        # Insert with progress bar and error handling
+        if TQDM_AVAILABLE:
+            with tqdm(total=total_rows, desc="Inserting rows", unit="row", unit_scale=True, ncols=100) as pbar:
                 for i in range(0, total_rows, chunksize):
-                    chunk_df = df_to_insert.iloc[i:i+chunksize]
+                    chunk_df = df_final.iloc[i:i+chunksize].copy()
+                    try:
+                        chunk_df.to_sql(
+                            name=table_name,
+                            con=engine,
+                            schema='public',
+                            if_exists='append',  # Append since we truncated if needed
+                            index=False,
+                            method='multi',  # Use multi-row INSERT for better performance
+                            chunksize=chunksize
+                        )
+                        pbar.update(len(chunk_df))
+                        # Update description with current progress
+                        pbar.set_postfix({
+                            'batch': f"{i//chunksize + 1}/{num_chunks}",
+                            'rows': f"{min(i+chunksize, total_rows):,}/{total_rows:,}"
+                        })
+                    except Exception as e:
+                        logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
+                        # Try inserting row by row to identify problematic rows
+                        logging.warning(f"   ⚠️  Attempting row-by-row insertion for this batch...")
+                        failed_rows = 0
+                        for idx, row in chunk_df.iterrows():
+                            try:
+                                row.to_frame().T.to_sql(
+                                    name=table_name,
+                                    con=engine,
+                                    schema='public',
+                                    if_exists='append',
+                                    index=False
+                                )
+                                pbar.update(1)
+                            except Exception as row_error:
+                                failed_rows += 1
+                                logging.error(f"   ❌ Failed to insert row {idx}: {row_error}")
+                                logging.error(f"      Incident: {row.get('incident_number', 'N/A')}")
+                        if failed_rows > 0:
+                            logging.warning(f"   ⚠️  {failed_rows} rows failed to insert in this batch")
+                        else:
+                            logging.info(f"   ✓ All rows in batch inserted successfully")
+        else:
+            # Fallback: insert without progress bar but with logging
+            logging.info("   (Install tqdm for progress bar: pip install tqdm)")
+            for i in range(0, total_rows, chunksize):
+                chunk_df = df_final.iloc[i:i+chunksize].copy()
+                try:
                     chunk_df.to_sql(
                         name=table_name,
                         con=engine,
                         schema='public',
-                        if_exists='append',
+                        if_exists='append',  # Append since we truncated if needed
                         index=False,
-                        method='multi',
+                        method='multi',  # Use multi-row INSERT for better performance
                         chunksize=chunksize
                     )
-                    pbar.update(len(chunk_df))
-        except ImportError:
-            # Fallback without progress bar
-            df_to_insert.to_sql(
-                name=table_name,
-                con=engine,
-                schema='public',
-                if_exists='append',
-                index=False,
-                method='multi',
-                chunksize=chunksize
-            )
+                    if (i // chunksize + 1) % 10 == 0 or i + chunksize >= total_rows:
+                        logging.info(f"   Inserted {min(i+chunksize, total_rows):,}/{total_rows:,} rows...")
+                except Exception as e:
+                    logging.error(f"   ❌ Error inserting batch {i//chunksize + 1}: {e}")
+                    raise
         
-        print(f"✅ Successfully inserted {len(df_to_insert):,} rows")
-        
-        # Verify
-        with engine.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM "{table_name}"'))
-            count = result.fetchone()[0]
-            print(f"✅ Verified: {count:,} rows in table")
+        logging.info(f"✅ Insertion completed!")
         
         engine.dispose()
+        
+        # Verify final row count
+        engine = create_engine(connection_string, pool_pre_ping=True)
+        with engine.connect() as conn:
+            result = conn.execute(text(f"SELECT COUNT(*) FROM \"{table_name}\";"))
+            final_rows = result.fetchone()[0]
+        engine.dispose()
+        
+        logging.info(f"\n{'='*80}")
+        logging.info("✅ SUCCESS!")
+        logging.info(f"{'='*80}")
+        logging.info(f"✓ Wrote {len(df_final):,} rows to PostgreSQL")
+        logging.info(f"✓ Database: {database}")
+        logging.info(f"✓ Table: {table_name}")
+        logging.info(f"✓ Total rows in table now: {final_rows:,}")
+        if not truncate:
+            logging.info(f"   (Previous: {existing_rows:,}, Added: {len(df_final):,})")
+        logging.info(f"{'='*80}\n")
+        
         return True
         
     except Exception as e:
-        print(f"❌ Error loading to PostgreSQL: {e}")
-        traceback.print_exc()
-        return False
-
-# ------------------------------------------------------------------------
-# Main Pipeline Function
-# ------------------------------------------------------------------------
-def run_complete_pipeline(start_date="2024-01-01", end_date=None, 
-                         output_csv=None, table_name='Incident_Data',
-                         truncate_table=True, skip_categorization=False):
-    """
-    Complete pipeline: Fetch -> Merge -> Fix -> Export -> Categorize -> Load to DB
-    """
-    print("=" * 80)
-    print("🚀 COMPLETE INCIDENT DATA PIPELINE")
-    print("=" * 80)
-    print(f"📅 Date range: {start_date} to {end_date or 'current'}")
-    print(f"📊 Output CSV: {output_csv or 'auto-generated'}")
-    print(f"💾 PostgreSQL table: {table_name}")
-    print("=" * 80)
-    
-    try:
-        # Step 1: Connect to databases
-        print("\n" + "=" * 80)
-        print("STEP 1: CONNECTING TO DATABASES")
-        print("=" * 80)
-        
-        print("\n📡 Connecting to Atlas...")
-        atlas_session, atlas_catalog = create_atlas_session()
-        if not atlas_session:
-            print("❌ Failed to connect to Atlas")
-            return False
-        print(f"✅ Connected to Atlas: {atlas_catalog}")
-        
-        print("\n📡 Connecting to gsnow...")
-        gsnow_session, gsnow_catalog = create_gsnow_session()
-        if not gsnow_session:
-            print("❌ Failed to connect to gsnow")
-            return False
-        print(f"✅ Connected to gsnow: {gsnow_catalog}")
-        
-        # Step 2: Fetch data
-        print("\n" + "=" * 80)
-        print("STEP 2: FETCHING DATA FROM ATLAS AND GSNOW")
-        print("=" * 80)
-        
-        df_atlas = fetch_atlas_data(atlas_session, start_date, end_date)
-        df_gsnow = fetch_gsnow_data(gsnow_session, start_date, end_date)
-        
-        # Step 3: Merge and combine
-        print("\n" + "=" * 80)
-        print("STEP 3: MERGING DATASETS")
-        print("=" * 80)
-        
-        df_combined = map_and_combine(df_atlas, df_gsnow)
-        if df_combined is None:
-            print("❌ Failed to combine data")
-            return False
-        
-        # Step 4: Fix opened_at for gsnow records
-        print("\n" + "=" * 80)
-        print("STEP 4: FIXING opened_at FOR GSNOW RECORDS")
-        print("=" * 80)
-        
-        df_combined = fix_opened_at_for_gsnow(df_combined)
-        
-        # Step 5: Export to CSV
-        print("\n" + "=" * 80)
-        print("STEP 5: EXPORTING TO CSV")
-        print("=" * 80)
-        
-        if output_csv is None:
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_csv = f"incidents_merged_{timestamp}.csv"
-        
-        print(f"💾 Saving to: {output_csv}")
-        df_combined.to_csv(output_csv, index=False, encoding='utf-8')
-        print(f"✅ Exported {len(df_combined):,} rows to {output_csv}")
-        
-        # Step 6: Categorize (if not skipped)
-        df_categorized = None
-        categorized_csv = None
-        
-        if not skip_categorization:
-            categorized_csv = output_csv.replace('.csv', '_categorized.csv')
-            df_categorized = categorize_with_category_latest(output_csv, categorized_csv)
-            
-            if df_categorized is None:
-                print("⚠️  Categorization failed, using original data")
-                df_categorized = df_combined
-                categorized_csv = output_csv
-        else:
-            print("\n⏭️  Skipping categorization (--skip-categorization)")
-            df_categorized = df_combined
-            categorized_csv = output_csv
-        
-        # Step 7: Load to PostgreSQL
-        print("\n" + "=" * 80)
-        print("STEP 7: LOADING TO POSTGRESQL")
-        print("=" * 80)
-        
-        success = load_to_postgresql(
-            df_categorized,
-            table_name=table_name,
-            truncate=truncate_table
-        )
-        
-        if success:
-            print("\n" + "=" * 80)
-            print("✅ PIPELINE COMPLETED SUCCESSFULLY")
-            print("=" * 80)
-            print(f"📊 Total records processed: {len(df_categorized):,}")
-            print(f"📁 Merged CSV: {output_csv}")
-            if categorized_csv != output_csv:
-                print(f"📁 Categorized CSV: {categorized_csv}")
-            print(f"💾 PostgreSQL table: {table_name}")
-            print("=" * 80)
-            return True
-        else:
-            print("\n❌ Pipeline failed at PostgreSQL loading step")
-            return False
-            
-    except Exception as e:
-        print(f"\n❌ Pipeline failed: {e}")
-        traceback.print_exc()
+        logging.error(f"\n✗ Failed to export to PostgreSQL: {e}")
+        logging.error(traceback.format_exc())
         return False
 
 def main():
-    """Main execution function"""
-    import argparse
+    """Main execution function."""
+    setup_logging()
     
     parser = argparse.ArgumentParser(
-        description='Complete Incident Data Pipeline: Fetch -> Merge -> Fix -> Categorize -> Load to DB',
+        description='Push categorized incident CSV to PostgreSQL',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Flow:
-1. Pull data from Atlas and gsnow (2024 to current)
-2. Merge them properly (Atlas PRIMARY, gsnow supplementary)
-3. Fix opened_at issue (use created_on as fallback for gsnow)
-4. Export to CSV
-5. Run categorization script (category_latest.py) with GPT clustering
-6. Load categorized data to PostgreSQL
-
 Examples:
-  # Full pipeline with default settings
-  python complete_incident_pipeline.py
-  
-  # Custom date range
-  python complete_incident_pipeline.py --start-date 2024-06-01 --end-date 2024-12-31
-  
-  # Skip categorization
-  python complete_incident_pipeline.py --skip-categorization
-  
-  # Custom output file and table
-  python complete_incident_pipeline.py --output my_data.csv --table my_table
+  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv
+  python push_incidents_to_postgres.py incidents_categorized_20250101_120000.csv --truncate
+
+Environment variables (optional):
+  PGHOST=localhost
+  PGPORT=5432
+  PGDATABASE=service_automation_db
+  PGUSER=postgres
+  PGPASSWORD=your_password
+
+Or use .pgpass file for password-less authentication
         """
     )
     
-    parser.add_argument('--start-date', type=str, default='2024-01-01',
-                       help='Start date (YYYY-MM-DD, default: 2024-01-01)')
-    parser.add_argument('--end-date', type=str, default=None,
-                       help='End date (YYYY-MM-DD, default: current date)')
-    parser.add_argument('--output', type=str, default=None,
-                       help='Output CSV file path (default: auto-generated)')
-    parser.add_argument('--table', type=str, default='Incident_Data',
-                       help='PostgreSQL table name (default: Incident_Data)')
-    parser.add_argument('--no-truncate', action='store_true',
-                       help='Do not truncate table before inserting (default: truncate)')
-    parser.add_argument('--skip-categorization', action='store_true',
-                       help='Skip categorization step (default: run categorization)')
+    parser.add_argument('csv_file', help='Path to categorized incident CSV file')
+    parser.add_argument('--truncate', action='store_true', 
+                       help='Truncate table before inserting (overwrite mode)')
+    parser.add_argument('--table', type=str, default=None,
+                       help='Table name (default: incident_data, will be lowercase)')
+    parser.add_argument('--database', type=str, default=None,
+                       help='Database name (default: from config)')
+    parser.add_argument('--no-create-table', action='store_true',
+                       help='Do not create table if it does not exist (default: auto-create)')
     
     args = parser.parse_args()
     
-    success = run_complete_pipeline(
-        start_date=args.start_date,
-        end_date=args.end_date,
-        output_csv=args.output,
+    # Check if file exists
+    if not os.path.exists(args.csv_file):
+        logging.error(f"✗ CSV file not found: {args.csv_file}")
+        sys.exit(1)
+    
+    # Push to PostgreSQL
+    success = push_incidents_to_postgresql(
+        args.csv_file,
         table_name=args.table,
-        truncate_table=not args.no_truncate,
-        skip_categorization=args.skip_categorization
+        database=args.database,
+        truncate=args.truncate,
+        create_table=not args.no_create_table
     )
     
     if success:
@@ -953,3 +653,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
