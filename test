@@ -101,8 +101,6 @@ def setup_logging(log_file=None):
         print("   Continuing with console logging only...")
     
     return log_file
-    
-    return log_file
 
 # ------------------------------------------------------------------------
 # PostgreSQL Configuration
@@ -429,8 +427,8 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
             
             # Try parsing with multiple formats
             try:
-                # First try with pandas default parser
-                result = pd.to_datetime(normalized, errors='coerce', infer_datetime_format=True)
+                # First try with pandas default parser (removed infer_datetime_format - deprecated)
+                result = pd.to_datetime(normalized, errors='coerce')
                 
                 # Check if we have any nulls that might be parseable with different format
                 null_mask = result.isna()
@@ -445,12 +443,26 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                     ]:
                         try:
                             alt_result = pd.to_datetime(normalized[null_mask], format=fmt, errors='coerce')
+                            # Fix dtype compatibility - ensure both are timezone-naive (PostgreSQL TIMESTAMP is timezone-naive)
+                            if alt_result.dtype.tz is not None:
+                                alt_result = alt_result.dt.tz_localize(None)
+                            if result.dtype.tz is not None:
+                                result = result.dt.tz_localize(None)
+                            
+                            # Use proper assignment to avoid dtype warnings
+                            # Create new series with updated values
+                            result = result.copy()
                             result.loc[null_mask] = alt_result
                             null_mask = result.isna()
                             if not null_mask.any():
                                 break
-                        except:
+                        except Exception as fmt_error:
+                            logging.debug(f"      Format {fmt} failed: {fmt_error}")
                             continue
+                
+                # Ensure final result is timezone-naive
+                if result.dtype.tz is not None:
+                    result = result.dt.tz_localize(None)
                 
                 return result
             except Exception as e:
@@ -483,7 +495,19 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                 if df[col].dtype == 'object':
                     try:
                         initial_non_null = df[col].notna().sum()
-                        df[col] = parse_datetime_robust(df[col])
+                        # Parse datetime and ensure timezone-naive (PostgreSQL TIMESTAMP without timezone)
+                        parsed_result = parse_datetime_robust(df[col])
+                        
+                        # Convert to timezone-naive if timezone-aware (PostgreSQL TIMESTAMP is timezone-naive)
+                        if hasattr(parsed_result, 'dt') and parsed_result.dtype.tz is not None:
+                            parsed_result = parsed_result.dt.tz_localize(None)
+                        elif hasattr(parsed_result, 'dtype') and parsed_result.dtype.tz is not None:
+                            # For Series
+                            parsed_result = parsed_result.dt.tz_localize(None)
+                        
+                        # Assign to dataframe
+                        df[col] = parsed_result
+                        
                         # Check how many were successfully parsed
                         parsed_count = df[col].notna().sum()
                         total_count = len(df[col])
@@ -493,7 +517,11 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                             logging.error(f"   ❌ {col}: Failed to parse any values (had {initial_non_null:,} non-null)")
                             # Try basic conversion as fallback
                             try:
-                                df[col] = pd.to_datetime(df[col], errors='coerce')
+                                fallback_result = pd.to_datetime(df[col], errors='coerce')
+                                # Ensure timezone-naive
+                                if hasattr(fallback_result, 'dt') and fallback_result.dtype.tz is not None:
+                                    fallback_result = fallback_result.dt.tz_localize(None)
+                                df[col] = fallback_result
                                 retry_parsed = df[col].notna().sum()
                                 if retry_parsed > 0:
                                     logging.info(f"      ✓ Fallback parsing succeeded: {retry_parsed:,} values")
@@ -516,7 +544,11 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                         logging.error(traceback.format_exc())
                         # Try basic conversion as fallback
                         try:
-                            df[col] = pd.to_datetime(df[col], errors='coerce')
+                            fallback_result = pd.to_datetime(df[col], errors='coerce')
+                            # Ensure timezone-naive
+                            if hasattr(fallback_result, 'dt') and fallback_result.dtype.tz is not None:
+                                fallback_result = fallback_result.dt.tz_localize(None)
+                            df[col] = fallback_result
                             logging.info(f"      ✓ Fallback conversion attempted")
                         except Exception as fallback_error:
                             logging.error(f"      ❌ Fallback conversion failed: {fallback_error}")
@@ -526,6 +558,7 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                     f"{date_conversion_stats['skipped']} skipped")
         
         # Convert boolean columns (handle BIT fields)
+        # Note: made_sla may contain string values like "Response - 8 hrs", so handle carefully
         logging.info(f"\n⏳ Converting boolean columns...")
         bool_columns = ['active', 'made_sla', 'knowledge']
         for col in bool_columns:
@@ -540,17 +573,31 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
                         if len(non_null) > 0:
                             unique_vals = non_null.astype(str).str.lower().unique()
                             # Check if values are boolean-like
-                            bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off']
-                            bool_like = all(v in bool_like_values for v in unique_vals)
+                            bool_like_values = ['true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off', '']
+                            bool_like = all(v.strip() in bool_like_values for v in unique_vals)
+                            
+                            # Special handling for made_sla - check if it contains SLA response strings
+                            if col == 'made_sla':
+                                # Check for SLA response patterns (e.g., "Response - 8 hrs", "Resolution - 16 hrs")
+                                has_sla_strings = any(
+                                    'response' in v or 'resolution' in v or 'hrs' in v or 'hours' in v 
+                                    for v in unique_vals
+                                )
+                                if has_sla_strings:
+                                    # Keep as string - contains SLA response information, not just boolean
+                                    logging.warning(f"   ⚠️  {col} kept as string (contains SLA response strings: {list(unique_vals[:5])})")
+                                    logging.warning(f"      This column should be VARCHAR in the database, not BOOLEAN/BIT")
+                                    continue  # Skip boolean conversion
                             
                             if bool_like and len(unique_vals) <= 4:
                                 # Convert to boolean
-                                df[col] = df[col].astype(str).str.lower().isin(['true', '1', 'yes', 'y', 't', 'on'])
+                                df[col] = df[col].astype(str).str.lower().str.strip().isin(['true', '1', 'yes', 'y', 't', 'on'])
                                 final_non_null = df[col].notna().sum()
                                 logging.info(f"   ✓ Converted {col} to boolean (non-null: {initial_non_null} -> {final_non_null}, unique values: {list(unique_vals)})")
                             else:
                                 # Keep as string but log
                                 logging.warning(f"   ⚠️  {col} kept as string (not boolean-like: {list(unique_vals[:5])})")
+                                logging.warning(f"      This column should be VARCHAR in the database, not BOOLEAN/BIT")
                         else:
                             # All null, set to boolean with all False
                             df[col] = False
@@ -751,6 +798,64 @@ def push_incidents_to_postgresql(csv_file_path, table_name=None, database=None,
         # Filter DataFrame to only include columns that exist in table
         columns_to_insert = [col for col in table_columns if col not in metadata_cols]
         df_final = df[[col for col in columns_to_insert if col in df.columns]].copy()
+        
+        # Validate data types match table schema before insertion
+        logging.info(f"\n⏳ Validating data types against table schema...")
+        try:
+            with engine.connect() as conn:
+                # Get column data types from table
+                result = conn.execute(text(f"""
+                    SELECT 
+                        column_name,
+                        data_type,
+                        udt_name
+                    FROM information_schema.columns
+                    WHERE table_name = '{table_name}'
+                    AND table_schema = 'public'
+                """))
+                table_schema = {row[0]: {'data_type': row[1], 'udt_name': row[2]} for row in result.fetchall()}
+            
+            # Check for type mismatches
+            type_mismatches = []
+            for col_name in df_final.columns:
+                if col_name in table_schema:
+                    table_type = table_schema[col_name]['udt_name']
+                    table_data_type = table_schema[col_name]['data_type']
+                    
+                    # Check boolean columns - ensure they're actually boolean
+                    if table_type in ['bool', 'bit']:
+                        if col_name in df_final.columns:
+                            # Check if column has non-boolean string values
+                            non_null = df_final[col_name].dropna()
+                            if len(non_null) > 0:
+                                str_vals = non_null.astype(str).str.lower().str.strip()
+                                # Check for non-boolean values
+                                bool_values = {'true', 'false', '1', '0', 'yes', 'no', 't', 'f', 'y', 'n', 'on', 'off', ''}
+                                non_bool_mask = ~str_vals.isin(bool_values)
+                                if non_bool_mask.any():
+                                    non_bool_vals = str_vals[non_bool_mask].unique()[:5]
+                                    type_mismatches.append({
+                                        'column': col_name,
+                                        'table_type': table_data_type,
+                                        'issue': f"Contains non-boolean values: {list(non_bool_vals)}",
+                                        'count': non_bool_mask.sum()
+                                    })
+                                    # Convert non-boolean values to None or handle them
+                                    logging.warning(f"   ⚠️  {col_name}: Table expects {table_data_type}, but CSV has non-boolean values")
+                                    logging.warning(f"      Found {non_bool_mask.sum():,} non-boolean values like: {list(non_bool_vals)}")
+                                    # Set non-boolean values to None to avoid insertion errors
+                                    mask = df_final[col_name].astype(str).str.lower().str.strip().isin(bool_values) | df_final[col_name].isna()
+                                    df_final.loc[~mask, col_name] = None
+                                    logging.warning(f"      Set {non_bool_mask.sum():,} non-boolean values to NULL")
+            
+            if type_mismatches:
+                logging.warning(f"   ⚠️  Found {len(type_mismatches)} columns with type mismatches (handled)")
+            else:
+                logging.info(f"   ✓ All data types match table schema")
+        except Exception as e:
+            logging.error(f"   ❌ Error validating data types: {e}")
+            logging.error(traceback.format_exc())
+            logging.warning(f"   ⚠️  Continuing without type validation...")
         
         # Validate and truncate VARCHAR columns to match table constraints
         logging.info(f"\n⏳ Validating data against table constraints...")
