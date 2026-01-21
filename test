@@ -1,441 +1,130 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Validate that database table incident_data matches the CSV file.
-Compares row counts, column counts, and actual values to identify discrepancies.
-
-Usage: python validate_csv_vs_database.py <csv_file_path> [--table-name incident_data] [--output report.txt]
+Pull incident data from PostgreSQL for the last 3 months.
+Detailed handling of date columns to prevent CSV/Excel formatting issues.
 """
 
 import os
 import sys
 import pandas as pd
-import traceback
 import logging
+import traceback
 from datetime import datetime
-import argparse
 from urllib.parse import quote_plus
-from dotenv import load_dotenv
 
 # PostgreSQL client
 try:
-    import psycopg2
-    from sqlalchemy import create_engine, text, inspect
+    from sqlalchemy import create_engine, text
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
     print("ERROR: PostgreSQL libraries not available.")
-    print("Please install: pip install psycopg2-binary sqlalchemy pandas python-dotenv")
+    print("Please install: pip install psycopg2-binary sqlalchemy pandas")
     sys.exit(1)
+
+# ------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------
+POSTGRES_CONFIG = {
+    'host': os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net'),
+    'port': os.getenv('PGPORT', '5432'),
+    'database': os.getenv('PGDATABASE', 'service_automation_db'),
+    'user': os.getenv('PGUSER', 'powerbi_user'),
+    'password': os.getenv('PGPASSWORD', 'Report@123'),
+    'table_name': 'incident_data' 
+}
+
+OUTPUT_FILE = "incident_data_last_3_months.csv"
 
 # ------------------------------------------------------------------------
 # Logging Configuration
 # ------------------------------------------------------------------------
-def setup_logging(log_file=None):
-    """Set up logging configuration to both console and file."""
-    if log_file is None:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        log_file = f"validate_csv_db_{timestamp}.log"
-    
-    log_dir = os.path.dirname(log_file) if os.path.dirname(log_file) else '.'
-    if log_dir and not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
-    
-    formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
+def setup_logging():
+    """Set up logging to console."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    root_logger.handlers = []
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    # File handler
-    try:
-        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        root_logger.addHandler(file_handler)
-        print(f"📝 Logging to file: {os.path.abspath(log_file)}")
-    except Exception as e:
-        print(f"⚠️  Could not create log file '{log_file}': {e}")
-    
-    return log_file
 
 # ------------------------------------------------------------------------
-# Database Connection
+# Main Function
 # ------------------------------------------------------------------------
-def create_db_connection(database=None, user=None, host=None, port=None, password=None):
-    """Create PostgreSQL database connection."""
-    # Load environment variables
-    load_dotenv()
+def pull_incidents():
+    """
+    Connect to PostgreSQL, run robust query, and save to CSV.
+    """
+    setup_logging()
     
-    # Get connection parameters - match push_incidents_to_postgres.py configuration
-    db_host = host or os.getenv('PGHOST', 'xd1e1159676dev.ubscloud-prod.msad.ubs.net')
-    db_port = port or os.getenv('PGPORT', '5432')
-    db_name = database or os.getenv('PGDATABASE', 'service_automation_db')
-    db_user = user or os.getenv('PGUSER', 'powerbi_user')
-    db_password = password or os.getenv('PGPASSWORD', 'Report@123')
-    
+    if not POSTGRES_AVAILABLE:
+        logging.error("PostgreSQL libraries are missing.")
+        return False
+
     try:
+        logging.info("="*80)
+        logging.info("📥 Pulling Incident Data from PostgreSQL")
+        logging.info("="*80)
+        
+        # Connection details
+        user = POSTGRES_CONFIG['user']
+        password = POSTGRES_CONFIG['password']
+        host = POSTGRES_CONFIG['host']
+        port = POSTGRES_CONFIG['port']
+        database = POSTGRES_CONFIG['database']
+        
         # Create connection string
-        connection_string = f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_name}"
-        engine = create_engine(connection_string, pool_pre_ping=True)
-        
-        # Test connection
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        
-        logging.info(f"✓ Connected to PostgreSQL: {db_host}:{db_port}/{db_name}")
-        return engine
-    except Exception as e:
-        logging.error(f"❌ Failed to connect to PostgreSQL: {e}")
-        logging.error(traceback.format_exc())
-        return None
-
-# ------------------------------------------------------------------------
-# Data Comparison Functions
-# ------------------------------------------------------------------------
-def normalize_value(val):
-    """Normalize values for comparison (handle NaN, None, empty strings, etc.)."""
-    if pd.isna(val) or val is None:
-        return None
-    if isinstance(val, (int, float)):
-        # Handle float comparison (round to avoid precision issues)
-        if isinstance(val, float):
-            return round(val, 10)
-        return val
-    if isinstance(val, str):
-        # Strip whitespace and handle empty strings
-        val = val.strip()
-        return val if val else None
-    if isinstance(val, datetime):
-        # Normalize datetime to string for comparison
-        return val.strftime('%Y-%m-%d %H:%M:%S')
-    return str(val).strip() if str(val).strip() else None
-
-def compare_dataframes(csv_df, db_df, key_column='incident_number'):
-    """
-    Compare two DataFrames and return differences.
-    
-    Returns:
-        dict with comparison results
-    """
-    results = {
-        'csv_row_count': len(csv_df),
-        'db_row_count': len(db_df),
-        'missing_in_db': [],
-        'extra_in_db': [],
-        'value_mismatches': [],
-        'column_differences': {}
-    }
-    
-    # Check row counts
-    if results['csv_row_count'] != results['db_row_count']:
-        logging.warning(f"⚠️  Row count mismatch: CSV has {results['csv_row_count']:,} rows, DB has {results['db_row_count']:,} rows")
-    
-    # Check if key column exists
-    if key_column not in csv_df.columns:
-        logging.error(f"❌ Key column '{key_column}' not found in CSV")
-        return results
-    if key_column not in db_df.columns:
-        logging.error(f"❌ Key column '{key_column}' not found in database")
-        return results
-    
-    # Set index to key column for easier comparison
-    csv_df_indexed = csv_df.set_index(key_column)
-    db_df_indexed = db_df.set_index(key_column)
-    
-    # Find rows missing in database
-    csv_keys = set(csv_df_indexed.index)
-    db_keys = set(db_df_indexed.index)
-    results['missing_in_db'] = list(csv_keys - db_keys)
-    results['extra_in_db'] = list(db_keys - csv_keys)
-    
-    if results['missing_in_db']:
-        logging.warning(f"⚠️  {len(results['missing_in_db'])} rows in CSV but not in database")
-    if results['extra_in_db']:
-        logging.warning(f"⚠️  {len(results['extra_in_db'])} rows in database but not in CSV")
-    
-    # Find common columns
-    common_columns = set(csv_df.columns) & set(db_df.columns)
-    common_keys = csv_keys & db_keys
-    
-    logging.info(f"📊 Comparing {len(common_keys):,} common rows across {len(common_columns)} common columns")
-    
-    # Compare values for common rows and columns
-    mismatch_count = 0
-    max_mismatches_to_report = 100  # Limit reporting to avoid huge output
-    
-    for key in list(common_keys)[:10000]:  # Limit to first 10k for performance
-        if key in csv_df_indexed.index and key in db_df_indexed.index:
-            csv_row = csv_df_indexed.loc[key]
-            db_row = db_df_indexed.loc[key]
-            
-            for col in common_columns:
-                if col == key_column:
-                    continue
-                
-                csv_val = normalize_value(csv_row.get(col))
-                db_val = normalize_value(db_row.get(col))
-                
-                if csv_val != db_val:
-                    mismatch_count += 1
-                    if len(results['value_mismatches']) < max_mismatches_to_report:
-                        results['value_mismatches'].append({
-                            'key': key,
-                            'column': col,
-                            'csv_value': csv_val,
-                            'db_value': db_val
-                        })
-    
-    results['total_mismatches'] = mismatch_count
-    return results
-
-# ------------------------------------------------------------------------
-# Main Validation Function
-# ------------------------------------------------------------------------
-def validate_csv_vs_database(csv_file_path, table_name='incident_data', 
-                             database=None, user=None, host=None, port=None, 
-                             password=None, output_file=None):
-    """
-    Validate that database table matches CSV file.
-    
-    Parameters
-    ----------
-    csv_file_path : str
-        Path to CSV file
-    table_name : str
-        Database table name
-    database : str, optional
-        Database name
-    user : str, optional
-        Database user
-    host : str, optional
-        Database host
-    port : str, optional
-        Database port
-    password : str, optional
-        Database password
-    output_file : str, optional
-        Path to output report file
-    """
-    logging.info("=" * 80)
-    logging.info("🔍 CSV vs Database Validation")
-    logging.info("=" * 80)
-    
-    # Check CSV file exists
-    if not os.path.exists(csv_file_path):
-        logging.error(f"❌ CSV file not found: {csv_file_path}")
-        return False
-    
-    # Read CSV file
-    logging.info(f"\n📄 Reading CSV file: {csv_file_path}")
-    try:
-        csv_df = pd.read_csv(csv_file_path, low_memory=False)
-        logging.info(f"✓ Read {len(csv_df):,} rows, {len(csv_df.columns)} columns from CSV")
-        logging.info(f"   Columns: {', '.join(csv_df.columns[:10])}{'...' if len(csv_df.columns) > 10 else ''}")
-    except Exception as e:
-        logging.error(f"❌ Failed to read CSV file: {e}")
-        logging.error(traceback.format_exc())
-        return False
-    
-    # Connect to database
-    logging.info(f"\n🔌 Connecting to database...")
-    engine = create_db_connection(database, user, host, port, password)
-    if not engine:
-        return False
-    
-    # Read database table
-    logging.info(f"\n📊 Reading database table: {table_name}")
-    try:
-        with engine.connect() as conn:
-            # Check if table exists
-            inspector = inspect(engine)
-            if not inspector.has_table(table_name, schema='public'):
-                logging.error(f"❌ Table '{table_name}' does not exist in database")
-                return False
-            
-            # Get table columns
-            table_columns = [col['name'] for col in inspector.get_columns(table_name, schema='public')]
-            logging.info(f"✓ Table has {len(table_columns)} columns")
-            
-            # Read table data
-            db_df = pd.read_sql_table(table_name, engine, schema='public')
-            logging.info(f"✓ Read {len(db_df):,} rows from database")
-            
-    except Exception as e:
-        logging.error(f"❌ Failed to read database table: {e}")
-        logging.error(traceback.format_exc())
-        return False
-    
-    # Compare column names
-    logging.info(f"\n📋 Comparing columns...")
-    csv_columns = set(csv_df.columns)
-    db_columns = set(db_df.columns)
-    
-    missing_in_db = csv_columns - db_columns
-    extra_in_db = db_columns - csv_columns
-    common_columns = csv_columns & db_columns
-    
-    if missing_in_db:
-        logging.warning(f"⚠️  {len(missing_in_db)} columns in CSV but not in database: {list(missing_in_db)[:10]}")
-    if extra_in_db:
-        logging.warning(f"⚠️  {len(extra_in_db)} columns in database but not in CSV: {list(extra_in_db)[:10]}")
-    if common_columns:
-        logging.info(f"✓ {len(common_columns)} common columns found")
-    
-    # Compare data
-    logging.info(f"\n🔍 Comparing data values...")
-    comparison_results = compare_dataframes(csv_df, db_df, key_column='incident_number')
-    
-    # Print summary
-    logging.info("\n" + "=" * 80)
-    logging.info("📊 VALIDATION SUMMARY")
-    logging.info("=" * 80)
-    logging.info(f"CSV Rows: {comparison_results['csv_row_count']:,}")
-    logging.info(f"DB Rows: {comparison_results['db_row_count']:,}")
-    logging.info(f"Common Columns: {len(common_columns)}")
-    
-    if comparison_results['missing_in_db']:
-        logging.warning(f"❌ Missing in DB: {len(comparison_results['missing_in_db']):,} rows")
-        if len(comparison_results['missing_in_db']) <= 20:
-            logging.warning(f"   Examples: {comparison_results['missing_in_db'][:10]}")
-    
-    if comparison_results['extra_in_db']:
-        logging.warning(f"⚠️  Extra in DB: {len(comparison_results['extra_in_db']):,} rows")
-        if len(comparison_results['extra_in_db']) <= 20:
-            logging.warning(f"   Examples: {comparison_results['extra_in_db'][:10]}")
-    
-    if comparison_results['total_mismatches'] > 0:
-        logging.warning(f"❌ Value Mismatches: {comparison_results['total_mismatches']:,} differences found")
-        logging.warning(f"   Showing first {len(comparison_results['value_mismatches'])} examples:")
-        for i, mismatch in enumerate(comparison_results['value_mismatches'][:20], 1):
-            logging.warning(f"   {i}. {mismatch['key']} | {mismatch['column']}:")
-            logging.warning(f"      CSV: {mismatch['csv_value']}")
-            logging.warning(f"      DB:  {mismatch['db_value']}")
-    else:
-        logging.info("✓ No value mismatches found for compared rows")
-    
-    # Write detailed report to file
-    if output_file:
-        logging.info(f"\n📝 Writing detailed report to: {output_file}")
-        try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write("CSV vs Database Validation Report\n")
-                f.write("=" * 80 + "\n")
-                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"CSV File: {csv_file_path}\n")
-                f.write(f"Database Table: {table_name}\n\n")
-                
-                f.write(f"CSV Rows: {comparison_results['csv_row_count']:,}\n")
-                f.write(f"DB Rows: {comparison_results['db_row_count']:,}\n\n")
-                
-                if comparison_results['missing_in_db']:
-                    f.write(f"\nMissing in DB ({len(comparison_results['missing_in_db'])} rows):\n")
-                    for key in comparison_results['missing_in_db'][:100]:
-                        f.write(f"  - {key}\n")
-                
-                if comparison_results['extra_in_db']:
-                    f.write(f"\nExtra in DB ({len(comparison_results['extra_in_db'])} rows):\n")
-                    for key in comparison_results['extra_in_db'][:100]:
-                        f.write(f"  - {key}\n")
-                
-                if comparison_results['value_mismatches']:
-                    f.write(f"\nValue Mismatches (showing first 100):\n")
-                    for mismatch in comparison_results['value_mismatches'][:100]:
-                        f.write(f"\n  Key: {mismatch['key']}\n")
-                        f.write(f"  Column: {mismatch['column']}\n")
-                        f.write(f"  CSV Value: {mismatch['csv_value']}\n")
-                        f.write(f"  DB Value: {mismatch['db_value']}\n")
-                        f.write("-" * 40 + "\n")
-            
-            logging.info(f"✓ Report written to: {output_file}")
-        except Exception as e:
-            logging.error(f"❌ Failed to write report: {e}")
-    
-    # Final verdict
-    is_valid = (
-        comparison_results['csv_row_count'] == comparison_results['db_row_count'] and
-        len(comparison_results['missing_in_db']) == 0 and
-        len(comparison_results['extra_in_db']) == 0 and
-        comparison_results['total_mismatches'] == 0
-    )
-    
-    if is_valid:
-        logging.info("\n✅ VALIDATION PASSED: CSV and database match!")
-    else:
-        logging.warning("\n⚠️  VALIDATION FAILED: Differences found between CSV and database")
-    
-    engine.dispose()
-    return is_valid
-
-# ------------------------------------------------------------------------
-# Main Entry Point
-# ------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description='Validate that database table matches CSV file',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python validate_csv_vs_database.py incidents.csv
-  python validate_csv_vs_database.py incidents.csv --table-name incident_data --output report.txt
-  python validate_csv_vs_database.py incidents.csv --host localhost --port 5432 --database mydb
-        """
-    )
-    
-    parser.add_argument('csv_file', help='Path to CSV file to validate')
-    parser.add_argument('--table-name', default='incident_data', 
-                       help='Database table name (default: incident_data)')
-    parser.add_argument('--database', help='Database name (default: from PGDATABASE env var)')
-    parser.add_argument('--user', help='Database user (default: from PGUSER env var)')
-    parser.add_argument('--host', help='Database host (default: from PGHOST env var)')
-    parser.add_argument('--port', help='Database port (default: from PGPORT env var)')
-    parser.add_argument('--password', help='Database password (default: from PGPASSWORD env var)')
-    parser.add_argument('--output', help='Output report file path')
-    parser.add_argument('--log-file', help='Log file path (default: auto-generated)')
-    
-    args = parser.parse_args()
-    
-    # Setup logging
-    log_file = setup_logging(args.log_file)
-    
-    # Run validation
-    try:
-        success = validate_csv_vs_database(
-            csv_file_path=args.csv_file,
-            table_name=args.table_name,
-            database=args.database,
-            user=args.user,
-            host=args.host,
-            port=args.port,
-            password=args.password,
-            output_file=args.output
-        )
-        
-        if success:
-            logging.info(f"\n✅ Validation completed successfully")
-            sys.exit(0)
+        if password:
+            encoded_password = quote_plus(password)
+            connection_string = f"postgresql://{user}:{encoded_password}@{host}:{port}/{database}"
         else:
-            logging.warning(f"\n⚠️  Validation found differences. Check log for details.")
-            sys.exit(1)
+            connection_string = f"postgresql://{user}@{host}:{port}/{database}"
             
-    except KeyboardInterrupt:
-        logging.info("\n⚠️  Validation interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        logging.error(f"\n❌ Validation failed with error: {e}")
-        logging.error(traceback.format_exc())
-        sys.exit(1)
-    finally:
-        logging.info(f"\n📝 Log file: {os.path.abspath(log_file)}")
+        logging.info(f"   Connecting to {host}:{port}/{database}...")
+        engine = create_engine(connection_string)
+        
+        # The Query
+        # 1. Filters for incidents opened on or after Oct 1st, 2025
+        # 2. Formats opened_at as string to prevent CSV corruption
+        query = """
+        SELECT 
+            TO_CHAR(opened_at, 'YYYY-MM-DD HH24:MI:SS') as opened_at_formatted,
+            *
+        FROM incident_data 
+        WHERE 
+            opened_at >= '2025-10-01'
+        ORDER BY opened_at DESC;
+        """
+        
+        logging.info("   Executing query (Last 3 Months from 2025-10-01)...")
+        
+        # specialized execution to prevent memory issues with huge datasets if helpful, 
+        # but for 3 months `pd.read_sql` should be fine.
+        df = pd.read_sql(query, engine)
+        
+        row_count = len(df)
+        logging.info(f"✅ Query successful. Retrieved {row_count:,} records.")
+        
+        if row_count > 0:
+            logging.info(f"   Sample formatted date: {df['opened_at_formatted'].iloc[0]}")
+            
+            logging.info(f"⏳ Saving to {OUTPUT_FILE}...")
+            # Save to CSV
+            # index=False: don't save the pandas row index
+            # coding='utf-8-sig': helps Excel open UTF-8 files correctly with BOM
+            df.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+            
+            logging.info(f"✅ File saved successfully: {os.path.abspath(OUTPUT_FILE)}")
+            logging.info(f"   File size: {os.path.getsize(OUTPUT_FILE) / (1024*1024):.2f} MB")
+        else:
+            logging.warning("⚠️  No data found for the specified date range.")
 
-if __name__ == '__main__':
-    main()
+    except Exception as e:
+        logging.error(f"❌ Error: {e}")
+        logging.error(traceback.format_exc())
+        return False
+        
+    return True
+
+if __name__ == "__main__":
+    pull_incidents()
