@@ -7,17 +7,17 @@ export interface ChatMessage {
 function downloadCSV(csvContent: string, filename: string) {
   const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
-
+  
   const link = document.createElement("a");
   link.href = url;
   link.download = filename;
   link.click();
-
+  
   URL.revokeObjectURL(url);
 }
 
 export function exportToCSV(data: string[][], filename: string = "export.csv") {
-  const csvContent = data.map(row =>
+  const csvContent = data.map(row => 
     row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")
   ).join("\n");
   downloadCSV(csvContent, filename);
@@ -26,10 +26,10 @@ export function exportToCSV(data: string[][], filename: string = "export.csv") {
 export function exportObjectToCSV(data: Record<string, unknown> | Record<string, unknown>[], filename: string = "export.csv") {
   const dataArray = Array.isArray(data) ? data : [data];
   if (dataArray.length === 0) return;
-
+  
   const headers = Object.keys(dataArray[0]);
   const rows = dataArray.map(obj => headers.map(h => String(obj[h] ?? "")));
-
+  
   exportToCSV([headers, ...rows], filename);
 }
 
@@ -37,31 +37,9 @@ export function exportTextToCSV(text: string, filename: string = "export.csv") {
   downloadCSV(text, filename);
 }
 
-/**
- * Download base64-encoded gzip data as a .csv.gz file
- */
-export function exportGzipToCSV(base64GzipData: string, filename: string = "export.csv.gz") {
-  // Decode base64 to binary
-  const binaryString = atob(base64GzipData);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-
-  const blob = new Blob([bytes], { type: "application/gzip" });
-  const url = URL.createObjectURL(blob);
-
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-
-  URL.revokeObjectURL(url);
-}
-
 export function exportChatToCSV(messages: ChatMessage[], filename: string = "chat-history.csv") {
   const headers = ["Role", "Content", "Timestamp"];
-
+  
   const rows = messages.map(msg => [
     msg.role,
     msg.content,
